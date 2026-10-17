@@ -54,6 +54,7 @@ type WorkerMessage =
       staff?: number;
       tokens?: number;
     }
+  | { type: "loaded" }
   | { type: "ready" }
   | { type: "result"; id: number; xml: string }
   | { type: "error"; id?: number; msg: string }
@@ -186,7 +187,7 @@ export function warmupLocalOmrEngine(): void {
     const state: WarmupState = {
       worker,
       downloads: new Map<string, number>(),
-      pyStagePercent: 4,
+      pyStagePercent: 0,
       dlStagePercent: 0,
       setupText: "무료 인식 엔진 시작 중",
       engineReady: false,
@@ -196,7 +197,9 @@ export function warmupLocalOmrEngine(): void {
     warmupState = state;
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const { data } = event;
-      if (data.type === "ready") {
+      if (data.type === "loaded") {
+        worker.postMessage({ type: "init" });
+      } else if (data.type === "ready") {
         state.engineReady = true;
       } else if (data.type === "progress" && data.stage === "setup") {
         state.pyStagePercent = Math.max(state.pyStagePercent, Math.min(48, data.percent ?? state.pyStagePercent));
@@ -238,7 +241,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let nextId = 0;
   let currentPercent = 2;
   let currentMessage = "PDF를 기기에서 여는 중";
-  let pyStagePercent = adopted ? adopted.pyStagePercent : 4; // 0..48
+  let pyStagePercent = adopted ? adopted.pyStagePercent : 0; // 0..48
   let dlStagePercent = adopted ? adopted.dlStagePercent : 0; // 0..51
   let setupPercent = Math.max(4, Math.min(99, Math.round(pyStagePercent + dlStagePercent)));
   let setupText = adopted ? adopted.setupText : "무료 인식 엔진 시작 중";
@@ -288,7 +291,9 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   };
 
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
-    if (data.type === "ready") {
+    if (data.type === "loaded") {
+      worker.postMessage({ type: "init" });
+    } else if (data.type === "ready") {
       engineReady = true;
       setupPercent = 100;
       emitProgress(15, "악보 분석 시작 중");

@@ -309,10 +309,14 @@ async function init() {
   if (typeof WebAssembly.Suspending !== "function") {
     throw new Error("This browser lacks WebAssembly JSPI. Use an up-to-date Chrome.");
   }
-  post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진 및 모델 병렬 준비 시작" });
+  post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진 및 모델 다운로드 시작" });
 
-  // Kick off all 3 model downloads (157.5MB total) in parallel with Python setup
-  const modelsTask = Promise.all(MODELS.map((name) => downloadModel(name)));
+  // Stream the 3 ONNX models (157.5MB total) alongside Python setup without allocating 3x55MB in RAM at once
+  const modelsTask = (async () => {
+    for (const name of MODELS) {
+      await downloadModel(name);
+    }
+  })();
 
   const pythonTask = (async () => {
     ort = await import(ORT_URL + "ort.webgpu.min.mjs");
@@ -386,6 +390,7 @@ self.onmessage = async ({ data }) => {
       ready ??= init();
       await ready;
     } else if (data.type === "recognise") {
+      ready ??= init();
       await ready;
       const path = `/tmp/page${data.id}.png`;
       pyodide.FS.writeFile(path, new Uint8Array(data.image));
@@ -406,4 +411,5 @@ self.onmessage = async ({ data }) => {
     post({ type: "error", id: data.id, msg: String(e && e.message ? e.message : e) });
   }
 };
+post({ type: "loaded" });
 
