@@ -5,7 +5,7 @@ import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
 import { convertPdfLocally } from "../omr/localOmr";
 import { retainSelectedFile } from "./retainSelectedFile";
-import { ACCESS_STORAGE_KEY, ACCESS_TOKEN, buildInviteUrl, checkAndPersistAccess, verifyAccessKey } from "./accessGate";
+import { buildInviteUrl, checkAndPersistAccess } from "./accessGate";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
 import { ScoreLibrary } from "../storage/ScoreLibrary";
@@ -312,34 +312,18 @@ function Player({ item, settings }: { item: StoredScore; settings: SettingsState
   </div>;
 }
 
-function AccessGate({ onUnlock }: { onUnlock: () => void }) {
-  const [code, setCode] = useState("");
-  const [error, setError] = useState("");
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (verifyAccessKey(code)) {
-      try { localStorage.setItem(ACCESS_STORAGE_KEY, ACCESS_TOKEN); } catch { /* ignore */ }
-      onUnlock();
-    } else {
-      setError("초대 코드가 올바르지 않습니다. 공유받은 전용 링크로 접속해 주세요.");
-    }
-  };
+function AccessGate() {
   return <main className="access-gate">
-    <form className="access-card" onSubmit={submit}>
+    <div className="access-card">
       <span className="brand-mark"><Icon name="music" size={20}/></span>
       <h1>비공개 악보 공간</h1>
-      <p>초대 링크가 있는 사용자만 접속할 수 있습니다.<br/>전용 링크로 접속하거나 초대 코드를 입력해 주세요.</p>
-      <div className="access-input-row">
-        <input type="password" value={code} onChange={(e) => { setCode(e.target.value); setError(""); }} placeholder="초대 코드 입력" autoComplete="off"/>
-        <button type="submit" className="primary">입장</button>
-      </div>
-      {error && <div className="notice error small">{error}</div>}
-    </form>
+      <p>초대 링크가 있는 사용자만 접속할 수 있습니다.<br/>공유받은 전용 링크로 접속해 주세요.</p>
+    </div>
   </main>;
 }
 
 export function App() {
-  const [authorized, setAuthorized] = useState<boolean>(() => {
+  const [authorized] = useState<boolean>(() => {
     const res = checkAndPersistAccess();
     if (res.cleanedUrl && typeof history !== "undefined") {
       history.replaceState(null, "", res.cleanedUrl);
@@ -348,7 +332,7 @@ export function App() {
   });
   const [view, setView] = useState<View>(currentRoute()); const [refresh, setRefresh] = useState(0); const scores = useScores(refresh); const [settings, setSettings] = useSettings();
   useEffect(() => { const onHash = () => setView(currentRoute()); addEventListener("hashchange", onHash); if (!location.hash) go("home"); return () => removeEventListener("hashchange", onHash); }, []);
-  if (!authorized) return <AccessGate onUnlock={() => setAuthorized(true)}/>;
+  if (!authorized) return <AccessGate/>;
   const id = new URLSearchParams(location.hash.split("?")[1] || "").get("id"); const selected = scores.find((item) => item.id === id) ?? scores[0]!;
   if (view === "player") return <Player item={selected} settings={settings}/>;
   return <div className="app"><Header view={view}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores} onImported={() => setRefresh((v) => v + 1)}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
