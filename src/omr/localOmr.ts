@@ -1,14 +1,33 @@
-const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/build/";
+const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/legacy/build/";
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 
 export type OmrProgress = (percent: number, message: string) => void;
+
+export function ensurePdfjsPolyfills(): void {
+  const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
+  if (typeof proto.toHex !== "function") {
+    Object.defineProperty(proto, "toHex", {
+      value(this: Uint8Array): string {
+        let hex = "";
+        for (let i = 0; i < this.length; i += 1) {
+          hex += this[i]!.toString(16).padStart(2, "0");
+        }
+        return hex;
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+}
 
 export function formatLocalOmrError(reason: unknown): Error {
   const message = reason instanceof Error ? reason.message : String(reason);
   if (/invalid (?:root reference|pdf structure)/i.test(message)) {
     return new Error("PDF 내부 구조가 손상되었거나 표준 형식이 아닙니다. 브라우저에서 인쇄 → PDF로 저장한 새 파일을 다시 선택해 주세요.");
   }
-  if (/WebAssembly JSPI/i.test(message)) return new Error("무료 변환은 최신 Chrome 또는 Edge가 필요합니다.");
+  if (/WebAssembly JSPI/i.test(message)) {
+    return new Error("이 브라우저 버전은 기기 내 무료 변환(WebAssembly JSPI)을 지원하지 않습니다. 태블릿의 Chrome 앱(최신 버전)으로 열어 주세요.");
+  }
   return reason instanceof Error ? reason : new Error(message);
 }
 
@@ -55,6 +74,7 @@ export function mergeMusicXmlPages(pages: string[]): string {
 }
 
 async function renderPdf(file: File, onProgress: OmrProgress): Promise<ArrayBuffer[]> {
+  ensurePdfjsPolyfills();
   const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
   pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
   const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });

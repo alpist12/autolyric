@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
-import { formatLocalOmrError, mergeMusicXmlPages } from "./localOmr";
+import { ensurePdfjsPolyfills, formatLocalOmrError, mergeMusicXmlPages } from "./localOmr";
 
 Object.assign(globalThis, { DOMParser, XMLSerializer });
 
@@ -25,5 +25,19 @@ describe("formatLocalOmrError", () => {
   it("turns a broken PDF root error into a useful recovery instruction", () => {
     expect(formatLocalOmrError(new Error("Invalid root reference")).message).toContain("인쇄 → PDF로 저장");
     expect(formatLocalOmrError(new Error("Invalid PDF structure.")).message).toContain("인쇄 → PDF로 저장");
+  });
+});
+
+describe("ensurePdfjsPolyfills", () => {
+  it("polyfills Uint8Array.prototype.toHex when missing", () => {
+    const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
+    const original = proto.toHex;
+    try {
+      delete proto.toHex;
+      ensurePdfjsPolyfills();
+      expect(new Uint8Array([0, 15, 16, 255]).toHex?.()).toBe("000f10ff");
+    } finally {
+      if (original) proto.toHex = original;
+    }
   });
 });
