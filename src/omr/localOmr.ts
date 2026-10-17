@@ -74,10 +74,10 @@ export function mergeMusicXmlPages(pages: string[]): string {
     const source = parser.parseFromString(xml, "application/xml");
     if (source.getElementsByTagName("parsererror").length) throw new Error(`${pageIndex + 2}페이지의 MusicXML이 올바르지 않습니다.`);
     const sourceParts = directChildren(source.documentElement, "part");
-    if (sourceParts.length !== targetParts.length) throw new Error(`${pageIndex + 2}페이지에서 파트 수가 달라 자동으로 합칠 수 없습니다.`);
+    if (!sourceParts.length) return;
 
-    sourceParts.forEach((sourcePart, partIndex) => {
-      const targetPart = targetParts[partIndex]!;
+    targetParts.forEach((targetPart, partIndex) => {
+      const sourcePart = sourceParts[Math.min(partIndex, sourceParts.length - 1)]!;
       const measures = directChildren(sourcePart, "measure");
       measures.forEach((measure, measureIndex) => {
         const imported = target.importNode(measure, true) as Element;
@@ -113,16 +113,25 @@ export async function renderPdfPageToCanvas(file: File, pageNumber: number, canv
   pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
   const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const doc = await task.promise;
+  const offscreen = window.document.createElement("canvas");
   try {
     const page = await doc.getPage(Math.min(Math.max(1, pageNumber), doc.numPages));
     const base = page.getViewport({ scale: 1 });
     const scale = Math.min(maxWidth / base.width, 2.2);
     const viewport = page.getViewport({ scale });
-    canvas.width = Math.round(viewport.width);
-    canvas.height = Math.round(viewport.height);
-    await page.render({ canvas, viewport, background: "#ffffff" }).promise;
+    const width = Math.round(viewport.width);
+    const height = Math.round(viewport.height);
+    offscreen.width = width;
+    offscreen.height = height;
+    await page.render({ canvas: offscreen, viewport, background: "#ffffff" }).promise;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.drawImage(offscreen, 0, 0);
     page.cleanup();
   } finally {
+    offscreen.width = 0;
+    offscreen.height = 0;
     await task.destroy();
   }
 }
@@ -147,6 +156,8 @@ async function renderPdf(file: File, onProgress: (pct: number, msg: string) => v
       await page.render({ canvas, viewport, background: "#ffffff" }).promise;
       const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("PDF 페이지를 이미지로 만들지 못했습니다.")), "image/png"));
       rendered.push(await blob.arrayBuffer());
+      canvas.width = 0;
+      canvas.height = 0;
       page.cleanup();
     }
   } finally {
@@ -155,26 +166,59 @@ async function renderPdf(file: File, onProgress: (pct: number, msg: string) => v
   return rendered;
 }
 
-let warmupWorker: Worker | null = null;
+type WarmupState = {
+  worker: Worker;
+  downloads: Map<string, number>;
+  pyStagePercent: number;
+  dlStagePercent: number;
+  setupText: string;
+  engineReady: boolean;
+  error: Error | null;
+  listener: ((event: MessageEvent<WorkerMessage>) => void) | null;
+};
+
+let warmupState: WarmupState | null = null;
 
 export function warmupLocalOmrEngine(): void {
-  if (typeof Worker === "undefined" || typeof caches === "undefined" || warmupWorker) return;
+  if (typeof Worker === "undefined" || typeof caches === "undefined" || warmupState) return;
   try {
     const worker = new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
-    warmupWorker = worker;
-    worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
-      if (data.type === "ready" || data.type === "error") {
-        worker.terminate();
-        warmupWorker = null;
-      }
+    const state: WarmupState = {
+      worker,
+      downloads: new Map<string, number>(),
+      pyStagePercent: 4,
+      dlStagePercent: 0,
+      setupText: "무료 인식 엔진 시작 중",
+      engineReady: false,
+      error: null,
+      listener: null,
     };
-    worker.onerror = () => {
+    warmupState = state;
+    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+      const { data } = event;
+      if (data.type === "ready") {
+        state.engineReady = true;
+      } else if (data.type === "progress" && data.stage === "setup") {
+        state.pyStagePercent = Math.max(state.pyStagePercent, Math.min(48, data.percent ?? state.pyStagePercent));
+        if (data.detail) state.setupText = data.detail;
+      } else if (data.type === "progress" && data.stage === "download") {
+        state.downloads.set(data.name ?? "model", data.loaded ?? 0);
+        const loaded = [...state.downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
+        const total = Math.max(1, data.total ?? 157482318);
+        state.dlStagePercent = Math.max(state.dlStagePercent, Math.round(Math.min(1, loaded / total) * 51));
+      } else if (data.type === "error") {
+        state.error = new Error(data.msg);
+      }
+      state.listener?.(event);
+    };
+    worker.onerror = (event) => {
+      state.error = new Error(event.message || "기기 내 악보 인식기가 중지되었습니다.");
       worker.terminate();
-      warmupWorker = null;
+      if (warmupState === state) warmupState = null;
     };
     worker.postMessage({ type: "init" });
   } catch {
-    warmupWorker = null;
+    warmupState = null;
   }
 }
 
@@ -182,28 +226,30 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   if (file.size > MAX_PDF_BYTES) throw new Error("기기 내 변환 안정성을 위해 PDF는 20MB 이하만 지원합니다.");
   if (typeof Worker === "undefined" || typeof caches === "undefined") throw new Error("이 브라우저는 기기 내 악보 변환을 지원하지 않습니다.");
 
-  if (warmupWorker) {
-    warmupWorker.terminate();
-    warmupWorker = null;
+  const adopted = warmupState && !warmupState.error ? warmupState : null;
+  if (warmupState && warmupState !== adopted) {
+    warmupState.worker.terminate();
   }
+  warmupState = null;
 
-  const worker = new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
+  const worker = adopted ? adopted.worker : new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
   const pending = new Map<number, { resolve: (xml: string) => void; reject: (error: Error) => void }>();
-  const downloads = new Map<string, number>();
+  const downloads = adopted ? new Map(adopted.downloads) : new Map<string, number>();
   let nextId = 0;
   let currentPercent = 2;
   let currentMessage = "PDF를 기기에서 여는 중";
-  let pyStagePercent = 4; // 0..48
-  let dlStagePercent = 0; // 0..51
-  let setupPercent = 4;
-  let setupText = "무료 인식 엔진 시작 중";
-  let engineReady = false;
+  let pyStagePercent = adopted ? adopted.pyStagePercent : 4; // 0..48
+  let dlStagePercent = adopted ? adopted.dlStagePercent : 0; // 0..51
+  let setupPercent = Math.max(4, Math.min(99, Math.round(pyStagePercent + dlStagePercent)));
+  let setupText = adopted ? adopted.setupText : "무료 인식 엔진 시작 중";
+  let engineReady = adopted ? adopted.engineReady : false;
   let pdfRendered = false;
   let pageIndex = 0;
   let totalPages = 1;
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  if (engineReady) readyResolve();
 
   const RUNTIME_TOTAL_MB = 38.0;
   const MODELS_TOTAL_MB = 157.5;
@@ -325,8 +371,10 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   }, 1200);
 
   try {
-    emitProgress(3, "PDF를 기기에서 여는 중", "무료 인식 엔진 시작 중");
-    worker.postMessage({ type: "init" });
+    emitProgress(3, "PDF를 기기에서 여는 중", setupText);
+    if (!adopted) {
+      worker.postMessage({ type: "init" });
+    }
     const images = await renderPdf(file, (pct, msg) => {
       emitProgress(pct, msg);
     });

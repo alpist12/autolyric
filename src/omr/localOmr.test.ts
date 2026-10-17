@@ -15,9 +15,11 @@ describe("mergeMusicXmlPages", () => {
     expect(measures[1]?.getElementsByTagName("print")[0]?.getAttribute("new-page")).toBe("yes");
   });
 
-  it("rejects pages whose part layout changed", () => {
+  it("gracefully merges pages even when a later page has no parts or different part counts", () => {
     const empty = `<?xml version="1.0"?><score-partwise><part-list/></score-partwise>`;
-    expect(() => mergeMusicXmlPages([page("C"), empty])).toThrow("파트 수가 달라");
+    const merged = new DOMParser().parseFromString(mergeMusicXmlPages([page("C"), empty]), "application/xml");
+    const measures = Array.from(merged.getElementsByTagName("measure"));
+    expect(measures).toHaveLength(1);
   });
 });
 
