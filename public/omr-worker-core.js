@@ -90,34 +90,49 @@ async function downloadModel(name) {
     post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES, cached: true });
     return; // stored whole by an earlier version
   }
-  let loaded = 0;
-  for (let i = 0; i * PIECE < size; i++) {
-    const start = i * PIECE;
-    const end = Math.min(size, start + PIECE) - 1;
-    if (!(await cache.match(pieceKey(name, i)))) {
-      for (let attempt = 1; ; attempt++) {
+  const pieceCount = Math.ceil(size / PIECE);
+  const pieceProgress = new Array(pieceCount).fill(0);
+  let lastPost = 0;
+
+  const report = (force = false) => {
+    const now = performance.now();
+    if (!force && now - lastPost < 100) return;
+    lastPost = now;
+    const loaded = pieceProgress.reduce((a, b) => a + b, 0);
+    post({ type: "progress", stage: "download", name, loaded: Math.min(size, loaded), total: MODELS_TOTAL_BYTES });
+  };
+
+  let nextPiece = 0;
+  let abortedWhole = false;
+
+  async function workerLoop() {
+    while (!abortedWhole) {
+      const i = nextPiece++;
+      if (i >= pieceCount) break;
+      const start = i * PIECE;
+      const end = Math.min(size, start + PIECE) - 1;
+      const pieceLen = end - start + 1;
+      if (await cache.match(pieceKey(name, i))) {
+        pieceProgress[i] = pieceLen;
+        report(true);
+        continue;
+      }
+      for (let attempt = 1; !abortedWhole; attempt++) {
         try {
-          let lastPost = 0;
           const got = await fetchPiece(modelUrl(name), start, end, (chunkBytes) => {
-            const now = performance.now();
-            if (now - lastPost > 120) {
-              lastPost = now;
-              post({
-                type: "progress",
-                stage: "download",
-                name,
-                loaded: Math.min(size, start + chunkBytes),
-                total: MODELS_TOTAL_BYTES,
-              });
-            }
+            pieceProgress[i] = Math.min(pieceLen, chunkBytes);
+            report(false);
           });
           if (got.whole) {
             if (got.whole.byteLength !== size) throw new Error("short read");
+            abortedWhole = true;
             await cache.put(modelUrl(name), new Response(got.whole));
             post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES });
             return;
           }
           await cache.put(pieceKey(name, i), new Response(got.piece));
+          pieceProgress[i] = pieceLen;
+          report(true);
           break;
         } catch (e) {
           if (attempt >= 8) {
@@ -126,13 +141,14 @@ async function downloadModel(name) {
             );
           }
           post({ type: "progress", stage: "retry", name, attempt });
-          await sleep(Math.min(30000, 2000 * attempt * attempt));
+          await sleep(Math.min(30000, 1500 * attempt * attempt));
         }
       }
     }
-    loaded = end + 1;
-    post({ type: "progress", stage: "download", name, loaded, total: MODELS_TOTAL_BYTES });
   }
+
+  // Download up to 4 pieces concurrently to saturate Wi-Fi bandwidth
+  await Promise.all(Array.from({ length: 4 }, () => workerLoop()));
 }
 
 async function modelBytes(name) {
@@ -322,73 +338,76 @@ async function init() {
   if (typeof WebAssembly.Suspending !== "function") {
     throw new Error("This browser lacks WebAssembly JSPI. Use an up-to-date Chrome.");
   }
-  post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진(ONNX) 불러오는 중" });
-  ort = await import(ORT_URL + "ort.webgpu.min.mjs");
-  ort.env.wasm.wasmPaths = ORT_URL;
-  ort.env.wasm.numThreads = self.crossOriginIsolated
-    ? Math.min(4, navigator.hardwareConcurrency || 1)
-    : 1;
-  post({ type: "log", msg: `WASM threads: ${ort.env.wasm.numThreads}` });
-  post({ type: "progress", stage: "setup", percent: 9, detail: "Pyodide 런타임 모듈 불러오는 중" });
-  const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
-  post({ type: "progress", stage: "setup", percent: 12, detail: "기기 그래픽 가속(WebGPU) 지원 확인 중" });
-  try {
-    useGpu = !!(
-      self.navigator.gpu &&
-      (await Promise.race([
-        navigator.gpu.requestAdapter(),
-        sleep(2500).then(() => null),
-      ]))
-    );
-  } catch {
-    useGpu = false;
-  }
+  post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진 및 모델 병렬 준비 시작" });
 
-  post({ type: "progress", stage: "setup", percent: 15, detail: "Python 가상환경 초기화 중 (약 10~20초 소요)" });
-  pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
-  pyodide.setStderr({ batched: (msg) => post({ type: "log", msg }) });
-  pyodide.setStdout({ batched: (msg) => post({ type: "log", msg }) });
+  // Kick off 157.5MB model downloads immediately in parallel with Python setup
+  const modelsTask = (async () => {
+    for (const name of MODELS) {
+      await downloadModel(name);
+    }
+  })();
 
-  const pkgs = [
-    ["typing-extensions", "기본 타입 확장 모듈", 22],
-    ["numpy", "수치 연산 엔진 (NumPy)", 28],
-    ["pillow", "이미지 처리 엔진 (Pillow)", 34],
-    ["opencv-python", "컴퓨터 비전 엔진 (OpenCV)", 42],
-  ];
-  for (let i = 0; i < pkgs.length; i++) {
-    const [pkg, label, pct] = pkgs[i];
-    post({ type: "progress", stage: "setup", percent: pct - 4, detail: `패키지 설치 중 (${i + 1}/${pkgs.length}) · ${label}` });
-    await pyodide.loadPackage([pkg]);
-    post({ type: "progress", stage: "setup", percent: pct, detail: `패키지 설치 완료 (${i + 1}/${pkgs.length}) · ${label}` });
-  }
+  const pythonTask = (async () => {
+    ort = await import(ORT_URL + "ort.webgpu.min.mjs");
+    ort.env.wasm.wasmPaths = ORT_URL;
+    ort.env.wasm.numThreads = self.crossOriginIsolated
+      ? Math.min(4, navigator.hardwareConcurrency || 1)
+      : 1;
+    post({ type: "log", msg: `WASM threads: ${ort.env.wasm.numThreads}` });
+    post({ type: "progress", stage: "setup", percent: 9, detail: "Pyodide 런타임 모듈 불러오는 중" });
+    const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
+    post({ type: "progress", stage: "setup", percent: 12, detail: "기기 그래픽 가속(WebGPU) 지원 확인 중" });
+    try {
+      useGpu = !!(
+        self.navigator.gpu &&
+        (await Promise.race([
+          navigator.gpu.requestAdapter(),
+          sleep(2500).then(() => null),
+        ]))
+      );
+    } catch {
+      useGpu = false;
+    }
 
-  const lib = "/home/pyodide/lib";
-  pyodide.FS.mkdirTree(lib);
-  // Same deploy version as this worker (?v=… from scripts/stamp-version.mjs).
-  const v = "";
-  post({ type: "progress", stage: "setup", percent: 45, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
-  const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
-  pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
-  const version = new URLSearchParams(v).get("v");
-  for (const f of ["onnxruntime.py", "runner.py"]) {
-    let text = await (await fetch("https://raw.githubusercontent.com/pzfreo/partsong/18b38f2602ec5a4cf6230ebee391595a4d18d9fd/omr/" + f)).text();
-    // A copy cached by another version would run an old reader with this app
-    // (it happened, see sw.js): fetch it again past any cached copy, and stop
-    // with a clear message if it still isn't this version.
-    const mine = (t) => !version || f !== "runner.py" || t.includes(`VERSION = "${version}"`);
-    if (!mine(text)) text = await (await fetch(`omr/${f}${v}&fresh=${Date.now()}`, { cache: "reload" })).text();
-    if (!mine(text)) throw new Error("The music reader didn't update. Reload Partsong (twice if needed) and try again.");
-    pyodide.FS.writeFile(`${lib}/${f}`, text);
-  }
-  post({ type: "progress", stage: "setup", percent: 48, detail: "Python 악보 인식 모듈 컴파일 중" });
-  pyodide.runPython(`import sys; sys.path.insert(0, "${lib}")`);
-  recognise = pyodide.pyimport("runner").recognise;
-  recogniseProfiled = pyodide.pyimport("runner").recognise_profiled;
+    post({ type: "progress", stage: "setup", percent: 15, detail: "Python 가상환경 초기화 중" });
+    pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
+    pyodide.setStderr({ batched: (msg) => post({ type: "log", msg }) });
+    pyodide.setStdout({ batched: (msg) => post({ type: "log", msg }) });
 
-  post({ type: "progress", stage: "setup", percent: 50, detail: "신경망 모델(157.5MB) 다운로드 시작" });
-  for (const name of MODELS) {
-    await downloadModel(name);
-  }
+    const pkgs = [
+      ["typing-extensions", "기본 타입 확장 모듈", 22],
+      ["numpy", "수치 연산 엔진 (NumPy)", 28],
+      ["pillow", "이미지 처리 엔진 (Pillow)", 34],
+      ["opencv-python", "컴퓨터 비전 엔진 (OpenCV)", 42],
+    ];
+    for (let i = 0; i < pkgs.length; i++) {
+      const [pkg, label, pct] = pkgs[i];
+      post({ type: "progress", stage: "setup", percent: pct - 4, detail: `패키지 설치 중 (${i + 1}/${pkgs.length}) · ${label}` });
+      await pyodide.loadPackage([pkg]);
+      post({ type: "progress", stage: "setup", percent: pct, detail: `패키지 설치 완료 (${i + 1}/${pkgs.length}) · ${label}` });
+    }
+
+    const lib = "/home/pyodide/lib";
+    pyodide.FS.mkdirTree(lib);
+    const v = "";
+    post({ type: "progress", stage: "setup", percent: 45, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
+    const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
+    pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
+    const version = new URLSearchParams(v).get("v");
+    for (const f of ["onnxruntime.py", "runner.py"]) {
+      let text = await (await fetch("https://raw.githubusercontent.com/pzfreo/partsong/18b38f2602ec5a4cf6230ebee391595a4d18d9fd/omr/" + f)).text();
+      const mine = (t) => !version || f !== "runner.py" || t.includes(`VERSION = "${version}"`);
+      if (!mine(text)) text = await (await fetch(`omr/${f}${v}&fresh=${Date.now()}`, { cache: "reload" })).text();
+      if (!mine(text)) throw new Error("The music reader didn't update. Reload Partsong (twice if needed) and try again.");
+      pyodide.FS.writeFile(`${lib}/${f}`, text);
+    }
+    post({ type: "progress", stage: "setup", percent: 48, detail: "Python 악보 인식 모듈 컴파일 중" });
+    pyodide.runPython(`import sys; sys.path.insert(0, "${lib}")`);
+    recognise = pyodide.pyimport("runner").recognise;
+    recogniseProfiled = pyodide.pyimport("runner").recognise_profiled;
+  })();
+
+  await Promise.all([pythonTask, modelsTask]);
   post({ type: "progress", stage: "setup", percent: 100, detail: "무료 인식 엔진 설치 및 준비 완료" });
   post({ type: "ready", gpu: useGpu });
 }

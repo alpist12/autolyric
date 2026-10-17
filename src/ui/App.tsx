@@ -3,7 +3,7 @@ import { MicrophonePitchSource } from "../audio/MicrophonePitchSource";
 import { PracticeAudio } from "../audio/PracticeAudio";
 import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
-import { convertPdfLocally, formatLocalOmrError, getPdfPageCount, renderPdfPageToCanvas } from "../omr/localOmr";
+import { convertPdfLocally, formatLocalOmrError, getPdfPageCount, renderPdfPageToCanvas, warmupLocalOmrEngine } from "../omr/localOmr";
 import { retainSelectedFile } from "./retainSelectedFile";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
@@ -196,6 +196,8 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       setPdfPage(1);
       setPdfPageCount(1);
       setError("");
+      // Pre-warm OMR models & packages in background while user views the PDF
+      warmupLocalOmrEngine();
       try {
         const count = await getPdfPageCount(selected);
         setPdfPageCount(Math.max(1, count));

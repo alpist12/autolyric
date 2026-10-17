@@ -154,9 +154,37 @@ async function renderPdf(file: File, onProgress: (pct: number, msg: string) => v
   return rendered;
 }
 
+let warmupWorker: Worker | null = null;
+
+export function warmupLocalOmrEngine(): void {
+  if (typeof Worker === "undefined" || typeof caches === "undefined" || warmupWorker) return;
+  try {
+    const worker = new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
+    warmupWorker = worker;
+    worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
+      if (data.type === "ready" || data.type === "error") {
+        worker.terminate();
+        warmupWorker = null;
+      }
+    };
+    worker.onerror = () => {
+      worker.terminate();
+      warmupWorker = null;
+    };
+    worker.postMessage({ type: "init" });
+  } catch {
+    warmupWorker = null;
+  }
+}
+
 export async function convertPdfLocally(file: File, onProgress: OmrProgress): Promise<string> {
   if (file.size > MAX_PDF_BYTES) throw new Error("기기 내 변환 안정성을 위해 PDF는 20MB 이하만 지원합니다.");
   if (typeof Worker === "undefined" || typeof caches === "undefined") throw new Error("이 브라우저는 기기 내 악보 변환을 지원하지 않습니다.");
+
+  if (warmupWorker) {
+    warmupWorker.terminate();
+    warmupWorker = null;
+  }
 
   const worker = new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
   const pending = new Map<number, { resolve: (xml: string) => void; reject: (error: Error) => void }>();
@@ -164,8 +192,9 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let nextId = 0;
   let currentPercent = 2;
   let currentMessage = "PDF를 기기에서 여는 중";
-  let setupPercent = 2;
-  let setupCeiling = 8;
+  let pyStagePercent = 4; // 0..48
+  let dlStagePercent = 0; // 0..51
+  let setupPercent = 4;
   let setupText = "무료 인식 엔진 시작 중";
   let engineReady = false;
   let pdfRendered = false;
@@ -175,11 +204,10 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
-  const emitProgress = (percent?: number, message?: string, nextSetupPct?: number, nextSetupText?: string, nextCeiling?: number) => {
+  const emitProgress = (percent?: number, message?: string, nextSetupText?: string) => {
     if (percent !== undefined) currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
-    if (nextCeiling !== undefined) setupCeiling = Math.max(setupCeiling, nextCeiling);
-    if (nextSetupPct !== undefined) setupPercent = Math.max(setupPercent, Math.min(100, Math.round(nextSetupPct)));
+    setupPercent = Math.max(setupPercent, Math.min(99, Math.round(pyStagePercent + dlStagePercent)));
     if (nextSetupText) setupText = nextSetupText;
     onProgress(currentPercent, currentMessage, engineReady ? undefined : { setupPercent, setupText });
   };
@@ -188,27 +216,29 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     if (data.type === "ready") {
       engineReady = true;
       setupPercent = 100;
-      setupCeiling = 100;
       emitProgress(15, "악보 분석 시작 중");
       readyResolve();
     } else if (data.type === "progress" && data.stage === "setup") {
-      const sp = data.percent ?? setupPercent;
+      pyStagePercent = Math.max(pyStagePercent, Math.min(48, data.percent ?? pyStagePercent));
       const st = data.detail ?? "무료 인식 엔진 준비 중";
       const mainMsg = pdfRendered ? "무료 인식 엔진 설치 대기 중" : undefined;
-      // Top gauge stays steady while bottom setup gauge advances
-      emitProgress(undefined, mainMsg, sp, st, Math.min(50, sp + 4));
+      emitProgress(undefined, mainMsg, st);
     } else if (data.type === "progress" && data.stage === "download") {
       downloads.set(data.name ?? "model", data.loaded ?? 0);
       const loaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
       const total = Math.max(1, data.total ?? 157482318);
       const ratio = Math.min(1, loaded / total);
-      const sp = 50 + Math.round(ratio * 49);
-      const st = `신경망 모델 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
+      dlStagePercent = Math.max(dlStagePercent, Math.round(ratio * 51));
+      const st = ratio < 1
+        ? `신경망 모델 고속 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`
+        : pyStagePercent < 48
+          ? `모델 다운로드 완료 · ${setupText}`
+          : "신경망 모델 준비 완료";
       const mainMsg = pdfRendered ? "무료 인식 엔진 설치 대기 중" : undefined;
-      emitProgress(undefined, mainMsg, sp, st, sp);
+      emitProgress(undefined, mainMsg, st);
     } else if (data.type === "progress" && data.stage === "retry") {
       const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
-      emitProgress(undefined, undefined, setupPercent, st);
+      emitProgress(undefined, undefined, st);
     } else if (data.type === "progress" && data.stage === "infer") {
       const pageSpan = 79 / Math.max(1, totalPages);
       const pageBase = 15 + pageIndex * pageSpan;
@@ -255,14 +285,9 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
-  // While engine is installing, only tick the bottom setup gauge; once engine is ready, tick the top conversion gauge
+  // Gentle ticker during score analysis
   const ticker = setInterval(() => {
-    if (!engineReady) {
-      if (setupPercent < setupCeiling) {
-        setupPercent += 1;
-        emitProgress();
-      }
-    } else {
+    if (engineReady) {
       const pageCeiling = Math.min(93, 15 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 79));
       if (currentPercent < pageCeiling) {
         emitProgress(currentPercent + 1);
@@ -271,7 +296,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   }, 1200);
 
   try {
-    emitProgress(3, "PDF를 기기에서 여는 중", 3, "무료 인식 엔진 시작 중", 8);
+    emitProgress(3, "PDF를 기기에서 여는 중", "무료 인식 엔진 시작 중");
     worker.postMessage({ type: "init" });
     const images = await renderPdf(file, (pct, msg) => {
       emitProgress(pct, msg);
