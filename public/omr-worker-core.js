@@ -28,56 +28,61 @@ const onGpu = new Set(); // ids of sessions created on WebGPU
 const sessionIds = new Map();
 let useGpu = false;
 
-// Models download in 4 MB pieces (HTTP range requests), each stored as it
-// arrives, so a dropped or crawling connection resumes where it stopped (even
-// after the app is closed) instead of restarting a 57 MB file.
-const PIECE = 4 * 1024 * 1024;
-const STALL_MS = 30000;
+// Models are fetched over standard CORS-safe GET requests (cross-origin Range
+// headers trigger an OPTIONS preflight that GitHub Pages rejects with 405)
+// and streamed via ReadableStream for real-time MB & MB/s reporting.
+const STALL_MS = 45000;
 const MODEL_SIZES = {
   [MODELS[0]]: 57311361,
   [MODELS[1]]: 52861122,
   [MODELS[2]]: 47309835,
 };
 const modelUrl = (name) => new URL("models/" + name, "https://partsong.app/").href;
-const pieceKey = (name, i) => `${modelUrl(name)}?piece=${i}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function readResponseWithProgress(res, onChunk) {
-  if (!res.body || !onChunk) return res.arrayBuffer();
-  const reader = res.body.getReader();
-  const chunks = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
-    onChunk(total);
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return merged.buffer;
-}
-
-async function fetchPiece(url, start, end, onChunk) {
+async function fetchWholeModelWithProgress(url, expectedSize, onProgress) {
   const abort = new AbortController();
   let timer = setTimeout(() => abort.abort(), STALL_MS);
-  const resetTimer = (bytes) => {
+  const resetTimer = () => {
     clearTimeout(timer);
     timer = setTimeout(() => abort.abort(), STALL_MS);
-    if (onChunk) onChunk(bytes);
   };
   try {
-    const res = await fetch(url, { headers: { Range: `bytes=${start}-${end}` }, cache: "no-store", signal: abort.signal });
-    if (res.status === 200) return { whole: await readResponseWithProgress(res, resetTimer) }; // server ignores ranges
-    if (res.status !== 206) throw new Error(`unexpected response ${res.status}`);
-    const buf = await readResponseWithProgress(res, resetTimer);
-    if (buf.byteLength !== end - start + 1) throw new Error("short read");
-    return { piece: buf };
+    const res = await fetch(url, { signal: abort.signal });
+    if (!res.ok) throw new Error(`unexpected response ${res.status}`);
+    if (!res.body) {
+      const buf = await res.arrayBuffer();
+      if (onProgress) onProgress(buf.byteLength);
+      return buf;
+    }
+    const reader = res.body.getReader();
+    const out = new Uint8Array(expectedSize);
+    let chunks = null;
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      resetTimer();
+      if (!chunks && total + value.byteLength <= expectedSize) {
+        out.set(value, total);
+      } else {
+        if (!chunks) {
+          chunks = [out.slice(0, total)];
+        }
+        chunks.push(value);
+      }
+      total += value.byteLength;
+      if (onProgress) onProgress(total);
+    }
+    if (!chunks && total === expectedSize) return out.buffer;
+    if (!chunks) return out.slice(0, total).buffer;
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    return merged.buffer;
   } finally {
     clearTimeout(timer);
   }
@@ -86,83 +91,49 @@ async function fetchPiece(url, start, end, onChunk) {
 async function downloadModel(name) {
   const cache = await caches.open(MODEL_CACHE);
   const size = MODEL_SIZES[name];
-  if (await cache.match(modelUrl(name))) {
+  const url = modelUrl(name);
+  if (await cache.match(url)) {
     post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES, cached: true });
-    return; // stored whole by an earlier version
+    return;
   }
-  const pieceCount = Math.ceil(size / PIECE);
-  const pieceProgress = new Array(pieceCount).fill(0);
-  let lastPost = 0;
-
-  const report = (force = false) => {
-    const now = performance.now();
-    if (!force && now - lastPost < 100) return;
-    lastPost = now;
-    const loaded = pieceProgress.reduce((a, b) => a + b, 0);
-    post({ type: "progress", stage: "download", name, loaded: Math.min(size, loaded), total: MODELS_TOTAL_BYTES });
-  };
-
-  let nextPiece = 0;
-  let abortedWhole = false;
-
-  async function workerLoop() {
-    while (!abortedWhole) {
-      const i = nextPiece++;
-      if (i >= pieceCount) break;
-      const start = i * PIECE;
-      const end = Math.min(size, start + PIECE) - 1;
-      const pieceLen = end - start + 1;
-      if (await cache.match(pieceKey(name, i))) {
-        pieceProgress[i] = pieceLen;
-        report(true);
-        continue;
-      }
-      for (let attempt = 1; !abortedWhole; attempt++) {
-        try {
-          const got = await fetchPiece(modelUrl(name), start, end, (chunkBytes) => {
-            pieceProgress[i] = Math.min(pieceLen, chunkBytes);
-            report(false);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      let lastPost = 0;
+      const buf = await fetchWholeModelWithProgress(url, size, (loadedBytes) => {
+        const now = performance.now();
+        if (now - lastPost >= 100 || loadedBytes >= size) {
+          lastPost = now;
+          post({
+            type: "progress",
+            stage: "download",
+            name,
+            loaded: Math.min(size, loadedBytes),
+            total: MODELS_TOTAL_BYTES,
           });
-          if (got.whole) {
-            if (got.whole.byteLength !== size) throw new Error("short read");
-            abortedWhole = true;
-            await cache.put(modelUrl(name), new Response(got.whole));
-            post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES });
-            return;
-          }
-          await cache.put(pieceKey(name, i), new Response(got.piece));
-          pieceProgress[i] = pieceLen;
-          report(true);
-          break;
-        } catch (e) {
-          if (attempt >= 8) {
-            throw new Error(
-              `the connection keeps dropping (${e.message}). What has downloaded is kept; try again on a better connection`,
-            );
-          }
-          post({ type: "progress", stage: "retry", name, attempt });
-          await sleep(Math.min(30000, 1500 * attempt * attempt));
         }
+      });
+      if (buf.byteLength !== size) throw new Error(`short read (${buf.byteLength}/${size})`);
+      await cache.put(url, new Response(buf));
+      post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES });
+      return;
+    } catch (e) {
+      if (attempt >= 6) {
+        throw new Error(`모델 다운로드 연결이 불안정합니다 (${e.message}). 와이파이 연결을 확인한 뒤 다시 시도해 주세요.`);
       }
+      post({ type: "progress", stage: "retry", name, attempt });
+      await sleep(Math.min(15000, 1500 * attempt));
     }
   }
-
-  // Download up to 4 pieces concurrently to saturate Wi-Fi bandwidth
-  await Promise.all(Array.from({ length: 4 }, () => workerLoop()));
 }
 
 async function modelBytes(name) {
   const cache = await caches.open(MODEL_CACHE);
   const whole = await cache.match(modelUrl(name));
   if (whole) return new Uint8Array(await whole.arrayBuffer());
-  const size = MODEL_SIZES[name];
-  const bytes = new Uint8Array(size);
-  for (let i = 0; i * PIECE < size; i++) {
-    const piece = await cache.match(pieceKey(name, i));
-    if (!piece) throw new Error(`model piece missing: ${name} #${i}`);
-    bytes.set(new Uint8Array(await piece.arrayBuffer()), i * PIECE);
-  }
-  return bytes;
+  await downloadModel(name);
+  const retryWhole = await cache.match(modelUrl(name));
+  if (!retryWhole) throw new Error(`model missing in cache: ${name}`);
+  return new Uint8Array(await retryWhole.arrayBuffer());
 }
 
 const TYPED = {
@@ -340,12 +311,8 @@ async function init() {
   }
   post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진 및 모델 병렬 준비 시작" });
 
-  // Kick off 157.5MB model downloads immediately in parallel with Python setup
-  const modelsTask = (async () => {
-    for (const name of MODELS) {
-      await downloadModel(name);
-    }
-  })();
+  // Kick off all 3 model downloads (157.5MB total) in parallel with Python setup
+  const modelsTask = Promise.all(MODELS.map((name) => downloadModel(name)));
 
   const pythonTask = (async () => {
     ort = await import(ORT_URL + "ort.webgpu.min.mjs");

@@ -171,6 +171,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [progressText, setProgressText] = useState("악보 분석 중");
   const [setupProgress, setSetupProgress] = useState<number | null>(null);
   const [setupText, setSetupText] = useState("");
+  const [setupMeta, setSetupMeta] = useState("");
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
@@ -207,7 +208,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       return;
     }
     if (!isPdf) setPendingPdf(null);
-    setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setSetupProgress(isPdf ? 2 : null); setSetupText(isPdf ? "무료 인식 엔진 시작 대기 중" : ""); setFileName(selected.name); setError("");
+    setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setSetupProgress(isPdf ? 4 : null); setSetupText(isPdf ? "무료 인식 엔진 시작 중" : ""); setSetupMeta(isPdf ? "0.0 / 195.5 MB 설치됨 · 속도 측정 중…" : ""); setFileName(selected.name); setError("");
     try {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const xml = isPdf
@@ -217,9 +218,11 @@ function Upload({ onSaved }: { onSaved: () => void }) {
             if (details) {
               setSetupProgress(details.setupPercent);
               setSetupText(details.setupText);
+              setSetupMeta(details.setupMeta ?? "");
             } else {
               setSetupProgress(null);
               setSetupText("");
+              setSetupMeta("");
             }
           })
         : await readScoreFile(selected);
@@ -228,7 +231,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       const savedName = isPdf ? selected.name.replace(/\.pdf$/i, ".musicxml") : selected.name;
       await library.save({ id: score.id, name: savedName, xml, score, savedAt: Date.now() });
       setPendingPdf(null); setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); setSetupProgress(null); }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); setSetupProgress(null); setSetupMeta(""); }
   };
 
   return <main className={`page upload-page${pendingPdf ? " split-mode" : ""}`}>
@@ -286,6 +289,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
                       <b>{setupProgress}%</b>
                     </div>
                     <i><b style={{ width: `${setupProgress}%` }}/></i>
+                    {setupMeta && <small className="setup-meta-sub">{setupMeta}</small>}
                   </div>
                 )}
               </div>

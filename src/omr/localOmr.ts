@@ -4,6 +4,7 @@ const MAX_PDF_BYTES = 20 * 1024 * 1024;
 export type OmrProgressDetails = {
   setupPercent: number;
   setupText: string;
+  setupMeta?: string;
 };
 
 export type OmrProgress = (percent: number, message: string, details?: OmrProgressDetails) => void;
@@ -204,12 +205,40 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
+  const RUNTIME_TOTAL_MB = 38.0;
+  const MODELS_TOTAL_MB = 157.5;
+  const COMBINED_TOTAL_MB = RUNTIME_TOTAL_MB + MODELS_TOTAL_MB; // 195.5 MB
+  const startTime = performance.now();
+  let lastSpeedCheckTime = startTime;
+  let lastSpeedCheckMB = 0;
+  let smoothedSpeedMBps = 0;
+  let setupMeta = `0.0 / ${COMBINED_TOTAL_MB.toFixed(1)} MB 설치됨 · 속도 측정 중…`;
+
+  const updateMeta = () => {
+    const pyMB = (pyStagePercent / 48) * RUNTIME_TOTAL_MB;
+    const modelBytesLoaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
+    const modelMB = modelBytesLoaded / 1e6;
+    const installedMB = Math.min(COMBINED_TOTAL_MB, pyMB + modelMB);
+    const now = performance.now();
+    const dt = (now - lastSpeedCheckTime) / 1000;
+    if (dt >= 0.35) {
+      const instSpeed = Math.max(0, (installedMB - lastSpeedCheckMB) / dt);
+      smoothedSpeedMBps = smoothedSpeedMBps === 0 ? instSpeed : smoothedSpeedMBps * 0.65 + instSpeed * 0.35;
+      lastSpeedCheckTime = now;
+      lastSpeedCheckMB = installedMB;
+    }
+    const elapsedSec = Math.max(0.5, (now - startTime) / 1000);
+    const displaySpeed = smoothedSpeedMBps > 0.05 ? smoothedSpeedMBps : installedMB / elapsedSec;
+    setupMeta = `${installedMB.toFixed(1)} / ${COMBINED_TOTAL_MB.toFixed(1)} MB 설치됨 · ${displaySpeed.toFixed(1)} MB/s`;
+  };
+
   const emitProgress = (percent?: number, message?: string, nextSetupText?: string) => {
     if (percent !== undefined) currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
     setupPercent = Math.max(setupPercent, Math.min(99, Math.round(pyStagePercent + dlStagePercent)));
     if (nextSetupText) setupText = nextSetupText;
-    onProgress(currentPercent, currentMessage, engineReady ? undefined : { setupPercent, setupText });
+    updateMeta();
+    onProgress(currentPercent, currentMessage, engineReady ? undefined : { setupPercent, setupText, setupMeta });
   };
 
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
@@ -230,7 +259,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
       const ratio = Math.min(1, loaded / total);
       dlStagePercent = Math.max(dlStagePercent, Math.round(ratio * 51));
       const st = ratio < 1
-        ? `신경망 모델 고속 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`
+        ? "AI 신경망 모델(3종) 고속 다운로드 중"
         : pyStagePercent < 48
           ? `모델 다운로드 완료 · ${setupText}`
           : "신경망 모델 준비 완료";
