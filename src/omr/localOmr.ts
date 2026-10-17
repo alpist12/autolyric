@@ -1,7 +1,12 @@
 const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/legacy/build/";
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 
-export type OmrProgress = (percent: number, message: string) => void;
+export type OmrProgressDetails = {
+  setupPercent: number;
+  setupText: string;
+};
+
+export type OmrProgress = (percent: number, message: string, details?: OmrProgressDetails) => void;
 
 export function ensurePdfjsPolyfills(): void {
   const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
@@ -36,6 +41,8 @@ type WorkerMessage =
       type: "progress";
       stage: string;
       step?: string;
+      percent?: number;
+      detail?: string;
       name?: string;
       loaded?: number;
       total?: number;
@@ -86,7 +93,7 @@ export function mergeMusicXmlPages(pages: string[]): string {
   return new XMLSerializer().serializeToString(target);
 }
 
-async function renderPdf(file: File, onProgress: OmrProgress): Promise<ArrayBuffer[]> {
+async function renderPdf(file: File, onProgress: (pct: number, msg: string) => void): Promise<ArrayBuffer[]> {
   ensurePdfjsPolyfills();
   const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
   pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
@@ -124,35 +131,44 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let nextId = 0;
   let currentPercent = 2;
   let currentMessage = "PDF를 기기에서 여는 중";
+  let setupPercent = 2;
+  let setupText = "무료 인식 엔진 초기화 대기 중";
   let pageIndex = 0;
   let totalPages = 1;
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
-  const emitProgress = (percent: number, message?: string) => {
+  const emitProgress = (percent: number, message?: string, nextSetupPct?: number, nextSetupText?: string) => {
     currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
-    onProgress(currentPercent, currentMessage);
+    if (nextSetupPct !== undefined) setupPercent = Math.max(setupPercent, Math.min(100, Math.round(nextSetupPct)));
+    if (nextSetupText) setupText = nextSetupText;
+    onProgress(currentPercent, currentMessage, { setupPercent, setupText });
   };
 
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
     if (data.type === "ready") {
-      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다");
+      setupPercent = 100;
+      setupText = "무료 인식 엔진 설치 및 준비 완료";
+      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다", 100, "무료 인식 엔진 설치 및 준비 완료");
       readyResolve();
+    } else if (data.type === "progress" && data.stage === "setup") {
+      const sp = data.percent ?? setupPercent;
+      const st = data.detail ?? "무료 인식 엔진 준비 중";
+      const overall = 14 + Math.round((sp / 100) * 35);
+      emitProgress(overall, st, sp, st);
     } else if (data.type === "progress" && data.stage === "download") {
       downloads.set(data.name ?? "model", data.loaded ?? 0);
       const loaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
-      const ratio = loaded / Math.max(1, data.total ?? 1);
-      emitProgress(25 + ratio * 24, `무료 인식 모델 받는 중 · ${(loaded / 1e6).toFixed(1)}/${Math.round((data.total ?? 0) / 1e6)}MB`);
+      const total = Math.max(1, data.total ?? 157482318);
+      const ratio = Math.min(1, loaded / total);
+      const sp = 50 + Math.round(ratio * 49);
+      const st = `신경망 모델 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB (${Math.round(ratio * 100)}%)`;
+      emitProgress(30 + ratio * 19, st, sp, st);
     } else if (data.type === "progress" && data.stage === "retry") {
-      emitProgress(currentPercent, `연결을 다시 시도하는 중 · ${data.attempt ?? 1}회`);
-    } else if (data.type === "progress" && data.stage === "python") {
-      if (data.step === "ort") emitProgress(15, "WebAssembly 추론 엔진 불러오는 중");
-      else if (data.step === "runtime") emitProgress(18, "Python 런타임 초기화 중");
-      else if (data.step === "packages") emitProgress(21, "이미지·악보 분석 패키지 설치 중 (NumPy · OpenCV)");
-      else if (data.step === "homr") emitProgress(24, "악보 인식 라이브러리 구성 중");
-      else emitProgress(16, "기기 내 악보 인식기 시작 중");
+      const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
+      emitProgress(currentPercent, st, setupPercent, st);
     } else if (data.type === "progress" && data.stage === "infer") {
       const pageSpan = 44 / Math.max(1, totalPages);
       const pageBase = 50 + pageIndex * pageSpan;
@@ -199,20 +215,31 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
-  // Smoothly tick percentage during long synchronous WebAssembly/Python blocks so the UI never looks frozen
+  // Smoothly tick both setup gauge and overall gauge during long WASM/network blocks
   const ticker = setInterval(() => {
+    if (setupPercent < 98) {
+      setupPercent += 1;
+    }
     const ceiling = currentPercent < 50 ? 48 : Math.min(93, 50 + Math.round(((pageIndex + 0.92) / Math.max(1, totalPages)) * 44));
     if (currentPercent < ceiling) {
       emitProgress(currentPercent + 1);
+    } else {
+      onProgress(currentPercent, currentMessage, { setupPercent, setupText });
     }
-  }, 900);
+  }, 800);
 
   try {
-    emitProgress(3, "PDF를 기기에서 여는 중");
+    emitProgress(3, "PDF를 기기에서 여는 중", 4, "무료 인식 엔진 시작 중");
     worker.postMessage({ type: "init" });
-    const images = await renderPdf(file, (pct, msg) => emitProgress(pct, msg));
+    const images = await renderPdf(file, (pct, msg) => {
+      // Only update main message if worker hasn't already advanced past PDF rendering
+      if (currentPercent < 15) emitProgress(pct, msg);
+      else emitProgress(pct);
+    });
     totalPages = Math.max(1, images.length);
-    if (currentPercent < 15) emitProgress(15, "무료 인식 엔진 준비 중 · 첫 실행은 시간이 걸릴 수 있어요");
+    if (currentPercent <= 15) {
+      emitProgress(15, setupText !== "무료 인식 엔진 시작 중" ? setupText : "무료 인식 엔진 준비 중 · 첫 실행은 시간이 걸릴 수 있어요");
+    }
     await ready;
     const pages: string[] = [];
     for (let index = 0; index < images.length; index += 1) {

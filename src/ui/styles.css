@@ -29,5 +29,7 @@
 .library-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.secondary{height:42px;padding:0 14px;border:1px solid var(--line);border-radius:10px;background:#fff;color:#3f4654;font-weight:600}.secondary:disabled{opacity:.45;cursor:not-allowed}.share-notice{background:#eef8f3;color:var(--green);border:1px solid #cce8da}
 @media(max-width:680px){.library-heading{align-items:flex-start;gap:14px;flex-direction:column}.library-actions{width:100%;justify-content:flex-start}.library-actions .secondary{flex:1 1 145px}.library-actions .primary{flex:1 1 100%}}
 .drop-zone.has-file{border-style:solid;border-color:#75c5a3;background:#f7fcf9}.drop-zone.has-file .drop-icon{background:#e4f6ed;color:var(--green)}.drop-zone .file-selected-status{color:var(--green);font-weight:700}
+.gauge-group{display:flex;flex-direction:column;gap:5px;margin-top:6px}.gauge-header{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:13px;color:var(--muted)}.gauge-header b{font-weight:700;color:#20242c;font-variant-numeric:tabular-nums}.setup-gauge{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}.setup-gauge i b{background:linear-gradient(90deg,#1c7a57,#38b284)!important}.setup-gauge.done .gauge-header span,.setup-gauge.done .gauge-header b{color:var(--green)}
+
 
 

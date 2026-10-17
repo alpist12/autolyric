@@ -42,14 +42,40 @@ const modelUrl = (name) => new URL("models/" + name, "https://partsong.app/").hr
 const pieceKey = (name, i) => `${modelUrl(name)}?piece=${i}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchPiece(url, start, end) {
+async function readResponseWithProgress(res, onChunk) {
+  if (!res.body || !onChunk) return res.arrayBuffer();
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+    onChunk(total);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged.buffer;
+}
+
+async function fetchPiece(url, start, end, onChunk) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), STALL_MS);
+  let timer = setTimeout(() => abort.abort(), STALL_MS);
+  const resetTimer = (bytes) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => abort.abort(), STALL_MS);
+    if (onChunk) onChunk(bytes);
+  };
   try {
     const res = await fetch(url, { headers: { Range: `bytes=${start}-${end}` }, cache: "no-store", signal: abort.signal });
-    if (res.status === 200) return { whole: await res.arrayBuffer() }; // server ignores ranges
+    if (res.status === 200) return { whole: await readResponseWithProgress(res, resetTimer) }; // server ignores ranges
     if (res.status !== 206) throw new Error(`unexpected response ${res.status}`);
-    const buf = await res.arrayBuffer();
+    const buf = await readResponseWithProgress(res, resetTimer);
     if (buf.byteLength !== end - start + 1) throw new Error("short read");
     return { piece: buf };
   } finally {
@@ -59,8 +85,11 @@ async function fetchPiece(url, start, end) {
 
 async function downloadModel(name) {
   const cache = await caches.open(MODEL_CACHE);
-  if (await cache.match(modelUrl(name))) return; // stored whole by an earlier version
   const size = MODEL_SIZES[name];
+  if (await cache.match(modelUrl(name))) {
+    post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES, cached: true });
+    return; // stored whole by an earlier version
+  }
   let loaded = 0;
   for (let i = 0; i * PIECE < size; i++) {
     const start = i * PIECE;
@@ -68,7 +97,20 @@ async function downloadModel(name) {
     if (!(await cache.match(pieceKey(name, i)))) {
       for (let attempt = 1; ; attempt++) {
         try {
-          const got = await fetchPiece(modelUrl(name), start, end);
+          let lastPost = 0;
+          const got = await fetchPiece(modelUrl(name), start, end, (chunkBytes) => {
+            const now = performance.now();
+            if (now - lastPost > 120) {
+              lastPost = now;
+              post({
+                type: "progress",
+                stage: "download",
+                name,
+                loaded: Math.min(size, start + chunkBytes),
+                total: MODELS_TOTAL_BYTES,
+              });
+            }
+          });
           if (got.whole) {
             if (got.whole.byteLength !== size) throw new Error("short read");
             await cache.put(modelUrl(name), new Response(got.whole));
@@ -280,28 +322,40 @@ async function init() {
   if (typeof WebAssembly.Suspending !== "function") {
     throw new Error("This browser lacks WebAssembly JSPI. Use an up-to-date Chrome.");
   }
-  post({ type: "progress", stage: "python", step: "ort" });
+  post({ type: "progress", stage: "setup", percent: 5, detail: "WebAssembly 추론 엔진(ONNX) 불러오는 중" });
   ort = await import(ORT_URL + "ort.webgpu.min.mjs");
   ort.env.wasm.wasmPaths = ORT_URL;
   ort.env.wasm.numThreads = self.crossOriginIsolated
     ? Math.min(4, navigator.hardwareConcurrency || 1)
     : 1;
   post({ type: "log", msg: `WASM threads: ${ort.env.wasm.numThreads}` });
+  post({ type: "progress", stage: "setup", percent: 10, detail: "Pyodide 런타임 모듈 불러오는 중" });
   const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
   useGpu = !!(self.navigator.gpu && (await navigator.gpu.requestAdapter()));
 
-  post({ type: "progress", stage: "python", step: "runtime" });
+  post({ type: "progress", stage: "setup", percent: 15, detail: "Python 가상환경 초기화 중" });
   pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
   pyodide.setStderr({ batched: (msg) => post({ type: "log", msg }) });
   pyodide.setStdout({ batched: (msg) => post({ type: "log", msg }) });
-  post({ type: "progress", stage: "python", step: "packages" });
-  await pyodide.loadPackage(["numpy", "opencv-python", "pillow", "typing-extensions"]);
+
+  const pkgs = [
+    ["typing-extensions", "기본 타입 확장 모듈", 20],
+    ["numpy", "수치 연산 엔진 (NumPy)", 26],
+    ["pillow", "이미지 처리 엔진 (Pillow)", 32],
+    ["opencv-python", "컴퓨터 비전 엔진 (OpenCV)", 40],
+  ];
+  for (let i = 0; i < pkgs.length; i++) {
+    const [pkg, label, pct] = pkgs[i];
+    post({ type: "progress", stage: "setup", percent: pct - 3, detail: `패키지 설치 중 (${i + 1}/${pkgs.length}) · ${label}` });
+    await pyodide.loadPackage([pkg]);
+    post({ type: "progress", stage: "setup", percent: pct, detail: `패키지 설치 완료 (${i + 1}/${pkgs.length}) · ${label}` });
+  }
 
   const lib = "/home/pyodide/lib";
   pyodide.FS.mkdirTree(lib);
   // Same deploy version as this worker (?v=… from scripts/stamp-version.mjs).
   const v = "";
-  post({ type: "progress", stage: "python", step: "homr" });
+  post({ type: "progress", stage: "setup", percent: 43, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
   const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
   pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
   const version = new URLSearchParams(v).get("v");
@@ -315,13 +369,16 @@ async function init() {
     if (!mine(text)) throw new Error("The music reader didn't update. Reload Partsong (twice if needed) and try again.");
     pyodide.FS.writeFile(`${lib}/${f}`, text);
   }
+  post({ type: "progress", stage: "setup", percent: 46, detail: "Python 악보 인식 모듈 컴파일 중" });
   pyodide.runPython(`import sys; sys.path.insert(0, "${lib}")`);
   recognise = pyodide.pyimport("runner").recognise;
   recogniseProfiled = pyodide.pyimport("runner").recognise_profiled;
 
+  post({ type: "progress", stage: "setup", percent: 50, detail: "신경망 모델(157MB) 다운로드 확인 중" });
   for (const name of MODELS) {
     await downloadModel(name);
   }
+  post({ type: "progress", stage: "setup", percent: 100, detail: "무료 인식 엔진 설치 및 준비 완료" });
   post({ type: "ready", gpu: useGpu });
 }
 

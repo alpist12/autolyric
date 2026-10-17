@@ -127,6 +127,8 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("악보 분석 중");
+  const [setupProgress, setSetupProgress] = useState<number | null>(null);
+  const [setupText, setSetupText] = useState("");
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
@@ -147,18 +149,25 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       setPendingPdf(selected); setFileName(selected.name); setError(""); return;
     }
     if (!isPdf) setPendingPdf(null);
-    setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setFileName(selected.name); setError("");
+    setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setSetupProgress(isPdf ? 2 : null); setSetupText(isPdf ? "무료 인식 엔진 시작 대기 중" : ""); setFileName(selected.name); setError("");
     try {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const xml = isPdf
-        ? await convertPdfLocally(selected, (value, label) => { setProgress(value); setProgressText(label); })
+        ? await convertPdfLocally(selected, (value, label, details) => {
+            setProgress(value);
+            setProgressText(label);
+            if (details) {
+              setSetupProgress(details.setupPercent);
+              setSetupText(details.setupText);
+            }
+          })
         : await readScoreFile(selected);
       setProgress(96); setProgressText("악보 구조 확인 중");
       const score = parseMusicXml(xml);
       const savedName = isPdf ? selected.name.replace(/\.pdf$/i, ".musicxml") : selected.name;
       await library.save({ id: score.id, name: savedName, xml, score, savedAt: Date.now() });
       setPendingPdf(null); setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); setSetupProgress(null); }
   };
   return <main className="page upload-page">
     <div className="page-heading"><h1>악보를 업로드하세요</h1><p>PDF는 MusicXML로 변환하고, 기존 MusicXML은 바로 연주 모드로 엽니다.</p></div>
@@ -167,7 +176,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       <button className="primary" onClick={() => input.current?.click()}>{pendingPdf ? "다른 파일 선택" : "파일 선택"}</button><input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => { void handle(e.target.files?.[0]); }}/>{pendingPdf ? <small className="file-selected-status">✓ 선택 완료 · {(pendingPdf.size / 1024 / 1024).toFixed(1)}MB</small> : <small>PDF 20MB · MusicXML 50MB 이하</small>}
     </div>
     {pendingPdf && !busy && <section className="omr-connect"><div><strong>기기에서 무료 변환</strong><p>PDF는 서버로 보내지 않고 이 브라우저에서 MusicXML로 바꿉니다. 첫 변환 때만 약 157MB 인식 모델을 받으며 이후에는 기기에 캐시됩니다.</p></div><div><a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 · AGPL-3.0</a><button className="primary" onClick={() => void handle(pendingPdf, true)}>무료 변환 시작</button></div><small>최신 Chrome·Edge 권장 · 인쇄 악보용 · 변환 중 탭을 닫지 마세요. <a href="source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a></small></section>}
-    {busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><span>{progressText} · {progress}%</span><i><b style={{ width: `${progress}%` }}/></i></div></div>}
+    {busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><div className="gauge-group"><div className="gauge-header"><span>전체 변환 진행률 · {progressText}</span><b>{progress}%</b></div><i><b style={{ width: `${progress}%` }}/></i></div>{setupProgress !== null && <div className={`gauge-group setup-gauge${setupProgress >= 100 ? " done" : ""}`}><div className="gauge-header"><span>{setupProgress >= 100 ? "✓ 무료 인식 엔진 설치 완료" : `엔진 및 AI 모델 설치 게이지 · ${setupText}`}</span><b>{setupProgress}%</b></div><i><b style={{ width: `${setupProgress}%` }}/></i></div>}</div></div>}
     {error && <div className="notice error">{error}</div>}
   </main>;
 }
