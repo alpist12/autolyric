@@ -139,6 +139,7 @@ self.omrOrt = {
     if (!sessionIds.has(name)) {
       const id = sessions.length;
       sessionNames[id] = name;
+      post({ type: "progress", stage: "infer", step: "session", model: name.split("_")[0], index: id + 1, total: MODELS.length });
       sessions[id] = await newSession(id);
       sessionIds.set(name, id);
     }
@@ -153,6 +154,9 @@ self.omrOrt = {
   // tensor is released once it has been passed back in.
   async run(id, names, feeds, keep = []) {
     const t0 = performance.now();
+    const modelTag = (sessionNames[id] || "").split("_")[0];
+    const callNum = (runTimes[id]?.calls ?? 0) + 1;
+    post({ type: "progress", stage: "infer", step: "run", model: modelTag, calls: callNum });
     const inputs = {};
     const used = [];
     for (const [name, type, dims, bytes] of feeds) {
@@ -199,6 +203,8 @@ self.omrOrt = {
   // slur) and the attention output; the step whose rhythm is EOS isn't included.
   async generate(id, contextDims, contextBytes, start, nonote, eos, maxLen, heads, headDim, caches) {
     const t0 = performance.now();
+    const staffNum = ++staffCount;
+    post({ type: "progress", stage: "infer", step: "decode", staff: staffNum, tokens: 0 });
     const session = sessions[id];
     const context = new ort.Tensor("float32", new Float32Array(contextBytes.slice().buffer), contextDims);
     // After the first step homr passes only the context's first position.
@@ -225,6 +231,9 @@ self.omrOrt = {
       cache.forEach((t, i) => (feeds[`cache_in${i}`] = t));
       const out = await session.run(feeds, names);
       steps++;
+      if (steps % 4 === 0) {
+        post({ type: "progress", stage: "infer", step: "decode", staff: staffNum, tokens: steps });
+      }
       cache = names.slice(7).map((n) => out[n]);
       // Greedy: the most likely token at the last position of each head.
       const pick = (n) => {
@@ -243,6 +252,7 @@ self.omrOrt = {
       attention.push(Float32Array.from(a.data));
       last = { rhythm: chosen[0], pitch: chosen[1], lift: chosen[2], articulation: chosen[4], slur: chosen[5] };
     }
+    post({ type: "progress", stage: "infer", step: "decode", staff: staffNum, tokens: steps });
     const t = (runTimes[id] ??= { calls: 0, ms: 0 });
     t.calls += steps;
     t.ms += performance.now() - t0;
@@ -264,11 +274,13 @@ let recogniseProfiled;
 // Per page: time inside each model (session id -> { calls, ms }); the rest of
 // the page's time is homr's Python (image processing, decoding) in Pyodide.
 let runTimes = [];
+let staffCount = 0;
 
 async function init() {
   if (typeof WebAssembly.Suspending !== "function") {
     throw new Error("This browser lacks WebAssembly JSPI. Use an up-to-date Chrome.");
   }
+  post({ type: "progress", stage: "python", step: "ort" });
   ort = await import(ORT_URL + "ort.webgpu.min.mjs");
   ort.env.wasm.wasmPaths = ORT_URL;
   ort.env.wasm.numThreads = self.crossOriginIsolated
@@ -278,16 +290,18 @@ async function init() {
   const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
   useGpu = !!(self.navigator.gpu && (await navigator.gpu.requestAdapter()));
 
-  post({ type: "progress", stage: "python" });
+  post({ type: "progress", stage: "python", step: "runtime" });
   pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
   pyodide.setStderr({ batched: (msg) => post({ type: "log", msg }) });
   pyodide.setStdout({ batched: (msg) => post({ type: "log", msg }) });
+  post({ type: "progress", stage: "python", step: "packages" });
   await pyodide.loadPackage(["numpy", "opencv-python", "pillow", "typing-extensions"]);
 
   const lib = "/home/pyodide/lib";
   pyodide.FS.mkdirTree(lib);
   // Same deploy version as this worker (?v=… from scripts/stamp-version.mjs).
   const v = "";
+  post({ type: "progress", stage: "python", step: "homr" });
   const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
   pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
   const version = new URLSearchParams(v).get("v");
@@ -323,6 +337,7 @@ self.onmessage = async ({ data }) => {
       pyodide.FS.writeFile(path, new Uint8Array(data.image));
       const t0 = performance.now();
       runTimes = [];
+      staffCount = 0;
       // data.systems: the user's systems for this page (JSON), if they fixed it.
       // data.profile (tests/omr-bench.html): logs where the Python's time goes.
       const xml = await (data.profile ? recogniseProfiled : recognise).callPromising(path, data.systems ?? "");

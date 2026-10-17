@@ -32,7 +32,20 @@ export function formatLocalOmrError(reason: unknown): Error {
 }
 
 type WorkerMessage =
-  | { type: "progress"; stage: string; name?: string; loaded?: number; total?: number; attempt?: number }
+  | {
+      type: "progress";
+      stage: string;
+      step?: string;
+      name?: string;
+      loaded?: number;
+      total?: number;
+      attempt?: number;
+      model?: string;
+      index?: number;
+      calls?: number;
+      staff?: number;
+      tokens?: number;
+    }
   | { type: "ready" }
   | { type: "result"; id: number; xml: string }
   | { type: "error"; id?: number; msg: string }
@@ -82,7 +95,7 @@ async function renderPdf(file: File, onProgress: OmrProgress): Promise<ArrayBuff
   const rendered: ArrayBuffer[] = [];
   try {
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-      onProgress(5 + Math.round((pageNumber / document.numPages) * 10), `PDF ${pageNumber}/${document.numPages}페이지 준비 중`);
+      onProgress(4 + Math.round((pageNumber / document.numPages) * 10), `PDF ${pageNumber}/${document.numPages}페이지 이미지 변환 중`);
       const page = await document.getPage(pageNumber);
       const base = page.getViewport({ scale: 1 });
       const scale = Math.min(2480 / base.width, 4200 / Math.max(base.width, base.height));
@@ -109,20 +122,61 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   const pending = new Map<number, { resolve: (xml: string) => void; reject: (error: Error) => void }>();
   const downloads = new Map<string, number>();
   let nextId = 0;
+  let currentPercent = 2;
+  let currentMessage = "PDF를 기기에서 여는 중";
+  let pageIndex = 0;
+  let totalPages = 1;
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
+  const emitProgress = (percent: number, message?: string) => {
+    currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
+    if (message) currentMessage = message;
+    onProgress(currentPercent, currentMessage);
+  };
+
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
-    if (data.type === "ready") readyResolve();
-    else if (data.type === "progress" && data.stage === "download") {
+    if (data.type === "ready") {
+      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다");
+      readyResolve();
+    } else if (data.type === "progress" && data.stage === "download") {
       downloads.set(data.name ?? "model", data.loaded ?? 0);
       const loaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
       const ratio = loaded / Math.max(1, data.total ?? 1);
-      onProgress(15 + Math.round(ratio * 35), `무료 인식 모델 받는 중 · ${Math.round(loaded / 1e6)}/${Math.round((data.total ?? 0) / 1e6)}MB`);
-    } else if (data.type === "progress" && data.stage === "retry") onProgress(20, `연결을 다시 시도하는 중 · ${data.attempt ?? 1}회`);
-    else if (data.type === "progress" && data.stage === "python") onProgress(15, "기기 내 악보 인식기 시작 중");
-    else if (data.type === "result" || data.type === "error") {
+      emitProgress(25 + ratio * 24, `무료 인식 모델 받는 중 · ${(loaded / 1e6).toFixed(1)}/${Math.round((data.total ?? 0) / 1e6)}MB`);
+    } else if (data.type === "progress" && data.stage === "retry") {
+      emitProgress(currentPercent, `연결을 다시 시도하는 중 · ${data.attempt ?? 1}회`);
+    } else if (data.type === "progress" && data.stage === "python") {
+      if (data.step === "ort") emitProgress(15, "WebAssembly 추론 엔진 불러오는 중");
+      else if (data.step === "runtime") emitProgress(18, "Python 런타임 초기화 중");
+      else if (data.step === "packages") emitProgress(21, "이미지·악보 분석 패키지 설치 중 (NumPy · OpenCV)");
+      else if (data.step === "homr") emitProgress(24, "악보 인식 라이브러리 구성 중");
+      else emitProgress(16, "기기 내 악보 인식기 시작 중");
+    } else if (data.type === "progress" && data.stage === "infer") {
+      const pageSpan = 44 / Math.max(1, totalPages);
+      const pageBase = 50 + pageIndex * pageSpan;
+      const prefix = `악보 ${pageIndex + 1}/${totalPages}쪽`;
+      if (data.step === "session") {
+        const sub = ((data.index ?? 1) / Math.max(1, data.total ?? 3)) * 0.15;
+        emitProgress(pageBase + pageSpan * sub, `${prefix} · 신경망 모델 메모리에 올리는 중 (${data.index ?? 1}/${data.total ?? 3})`);
+      } else if (data.step === "run") {
+        if (data.model === "segnet") {
+          const sub = 0.15 + Math.min(0.25, (data.calls ?? 1) * 0.06);
+          emitProgress(pageBase + pageSpan * sub, `${prefix} · 오선보 및 기호 영역 검출 중 (블록 ${data.calls ?? 1})`);
+        } else if (data.model === "encoder") {
+          const sub = 0.4 + Math.min(0.2, (data.calls ?? 1) * 0.035);
+          emitProgress(pageBase + pageSpan * sub, `${prefix} · 보표 이미지 특징 인코딩 중 (${data.calls ?? 1}번째 보표)`);
+        }
+      } else if (data.step === "decode") {
+        const staffProgress = Math.min(0.38, ((data.staff ?? 1) - 1) * 0.06 + Math.min(0.06, ((data.tokens ?? 0) / 120) * 0.06));
+        const sub = 0.6 + staffProgress;
+        emitProgress(
+          pageBase + pageSpan * sub,
+          `${prefix} · ${data.staff ?? 1}번째 보표 음표 해독 중 (${data.tokens ?? 0}개 기호 인식됨)`,
+        );
+      }
+    } else if (data.type === "result" || data.type === "error") {
       const request = data.id === undefined ? undefined : pending.get(data.id);
       if (!request) {
         if (data.type === "error") readyReject(new Error(data.msg));
@@ -145,22 +199,36 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
+  // Smoothly tick percentage during long synchronous WebAssembly/Python blocks so the UI never looks frozen
+  const ticker = setInterval(() => {
+    const ceiling = currentPercent < 50 ? 48 : Math.min(93, 50 + Math.round(((pageIndex + 0.92) / Math.max(1, totalPages)) * 44));
+    if (currentPercent < ceiling) {
+      emitProgress(currentPercent + 1);
+    }
+  }, 900);
+
   try {
-    onProgress(3, "PDF를 기기에서 여는 중");
+    emitProgress(3, "PDF를 기기에서 여는 중");
     worker.postMessage({ type: "init" });
-    const images = await renderPdf(file, onProgress);
-    onProgress(15, "무료 인식 엔진 준비 중 · 첫 실행은 시간이 걸릴 수 있어요");
+    const images = await renderPdf(file, (pct, msg) => emitProgress(pct, msg));
+    totalPages = Math.max(1, images.length);
+    if (currentPercent < 15) emitProgress(15, "무료 인식 엔진 준비 중 · 첫 실행은 시간이 걸릴 수 있어요");
     await ready;
     const pages: string[] = [];
     for (let index = 0; index < images.length; index += 1) {
-      onProgress(50 + Math.round((index / images.length) * 42), `악보 ${index + 1}/${images.length}페이지 인식 중`);
+      pageIndex = index;
+      const pageStart = 50 + Math.round((index / totalPages) * 44);
+      emitProgress(pageStart, `악보 ${index + 1}/${images.length}쪽 분석 시작`);
       pages.push(await recognise(images[index]!));
+      const pageDone = 50 + Math.round(((index + 1) / totalPages) * 44);
+      emitProgress(pageDone, `악보 ${index + 1}/${images.length}쪽 인식 완료`);
     }
-    onProgress(94, "페이지를 하나의 MusicXML로 합치는 중");
+    emitProgress(95, "페이지를 하나의 MusicXML로 합치는 중");
     return mergeMusicXmlPages(pages);
   } catch (reason) {
     throw formatLocalOmrError(reason);
   } finally {
+    clearInterval(ticker);
     worker.terminate();
   }
 }
