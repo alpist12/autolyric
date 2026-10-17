@@ -3,8 +3,9 @@ import { MicrophonePitchSource } from "../audio/MicrophonePitchSource";
 import { PracticeAudio } from "../audio/PracticeAudio";
 import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
-import { convertPdfToMusicXml } from "../omr/flatOmr";
+import { convertPdfLocally } from "../omr/localOmr";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
+import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
 import { ScoreLibrary } from "../storage/ScoreLibrary";
 import type { NoteObservation, StoredScore, TrackingState } from "../types";
 import { demoXml } from "./demo";
@@ -128,22 +129,22 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
-  const [flatToken, setFlatToken] = useState("");
-  const handle = async (file?: File, token = "") => {
+  const handle = async (file?: File, confirmed = false) => {
     if (!file) return;
-    if (file.name.toLowerCase().endsWith(".pdf") && !token.trim()) {
+    if (file.name.toLowerCase().endsWith(".pdf") && !confirmed) {
       setPendingPdf(file); setFileName(file.name); setError(""); return;
     }
-    setBusy(true); setProgress(18); setFileName(file.name); setError("");
+    setPendingPdf(null); setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setFileName(file.name); setError("");
     try {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const xml = file.name.toLowerCase().endsWith(".pdf")
-        ? await convertPdfToMusicXml(file, token.trim(), (value, label) => { setProgress(value); setProgressText(label); })
+        ? await convertPdfLocally(file, (value, label) => { setProgress(value); setProgressText(label); })
         : await readScoreFile(file);
-      setProgress(62); setProgressText("악보 구조 확인 중");
+      setProgress(96); setProgressText("악보 구조 확인 중");
       const score = parseMusicXml(xml);
       const savedName = file.name.toLowerCase().endsWith(".pdf") ? file.name.replace(/\.pdf$/i, ".musicxml") : file.name;
       await library.save({ id: score.id, name: savedName, xml, score, savedAt: Date.now() });
-      setProgress(100); onSaved(); setTimeout(() => go("player", score.id), 250);
+      setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); }
   };
   return <main className="page upload-page">
@@ -152,18 +153,40 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       <span className="drop-icon"><Icon name="upload" size={30}/></span><h2>파일을 이곳에 끌어다 놓으세요</h2><p>PDF(.pdf) · MusicXML(.xml, .musicxml, .mxl)</p>
       <button className="primary" onClick={() => input.current?.click()}>파일 선택</button><input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => void handle(e.target.files?.[0])}/><small>PDF 20MB · MusicXML 50MB 이하</small>
     </div>
-    {pendingPdf && !busy && <section className="omr-connect"><div><strong>PDF 자동 변환</strong><p>Flat OMR이 악보를 인식합니다. 1페이지당 1크레딧이 사용되며 원본과 결과는 Flat에 최대 30일 보관됩니다.</p></div><label>Flat 개인 액세스 토큰<input type="password" value={flatToken} onChange={(e) => setFlatToken(e.target.value)} placeholder="omr 권한이 있는 토큰" autoComplete="off"/></label><div><a href="https://flat.io/developers/docs/api/omr/" target="_blank" rel="noreferrer">토큰 발급 안내</a><button className="primary" disabled={!flatToken.trim()} onClick={() => { const file = pendingPdf; setPendingPdf(null); void handle(file, flatToken); }}>크레딧 사용하고 변환</button></div><small>토큰은 이 화면의 메모리에만 두며 저장하지 않습니다.</small></section>}
-    {busy && <div className="upload-progress"><span className="file-icon"><Icon name="music"/></span><div><strong>{fileName}</strong><span>{progressText} · {progress}%</span><i><b style={{ width: `${progress}%` }}/></i></div></div>}
+    {pendingPdf && !busy && <section className="omr-connect"><div><strong>기기에서 무료 변환</strong><p>PDF는 서버로 보내지 않고 이 브라우저에서 MusicXML로 바꿉니다. 첫 변환 때만 약 157MB 인식 모델을 받으며 이후에는 기기에 캐시됩니다.</p></div><div><a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 · AGPL-3.0</a><button className="primary" onClick={() => void handle(pendingPdf, true)}>무료 변환 시작</button></div><small>최신 Chrome·Edge 권장 · 인쇄 악보용 · 변환 중 탭을 닫지 마세요. <a href="/source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a></small></section>}
+    {busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><span>{progressText} · {progress}%</span><i><b style={{ width: `${progress}%` }}/></i></div></div>}
     {error && <div className="notice error">{error}</div>}
   </main>;
 }
 
-function Library({ scores }: { scores: StoredScore[] }) {
+function Library({ scores, onImported }: { scores: StoredScore[]; onImported: () => void }) {
+  const shareInput = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState("recent");
+  const [message, setMessage] = useState("");
+  const exportScores = () => {
+    const blob = new Blob([createScoreflowBundle(scores, (id) => localStorage.getItem(`scoreflow-note:${id}`) || "")], { type: "application/json" });
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob); anchor.download = `scoreflow-band-${new Date().toISOString().slice(0, 10)}.scoreflow`; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+  };
+  const importScores = async (file?: File) => {
+    if (!file) return;
+    try {
+      if (file.size > 50 * 1024 * 1024) throw new Error("공유 파일은 50MB 이하만 가져올 수 있습니다.");
+      const shared = readScoreflowBundle(await file.text());
+      for (const item of shared) {
+        const score = parseMusicXml(item.xml);
+        await library.save({ id: score.id, name: item.name, xml: item.xml, score, savedAt: item.savedAt });
+        if (item.note) localStorage.setItem(`scoreflow-note:${score.id}`, item.note);
+      }
+      setMessage(`${shared.length}개의 악보와 메모를 가져왔습니다.`); onImported();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : "공유 파일을 가져오지 못했습니다."); }
+  };
   const filtered = scores.filter((item) => `${item.score.title} ${item.score.composer}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => sort === "title" ? a.score.title.localeCompare(b.score.title, "ko") : b.savedAt - a.savedAt);
   return <main className="page library-page">
-    <div className="library-heading"><div className="page-heading"><h1>내 악보</h1><p>{scores.length}개의 악보</p></div><button className="primary" onClick={() => go("upload")}><Icon name="plus"/>업로드</button></div>
+    <div className="library-heading"><div className="page-heading"><h1>내 악보</h1><p>{scores.length}개의 악보 · 이 기기에 저장됨</p></div><div className="library-actions"><button className="secondary" disabled={!scores.length} onClick={exportScores}>공유 파일 내보내기</button><button className="secondary" onClick={() => shareInput.current?.click()}>공유 파일 가져오기</button><input ref={shareInput} hidden type="file" accept=".scoreflow,application/json" onChange={(event) => { void importScores(event.target.files?.[0]); event.target.value = ""; }}/><button className="primary" onClick={() => go("upload")}><Icon name="plus"/>업로드</button></div></div>
+    {message && <div className="notice share-notice" role="status">{message}</div>}
     <div className="library-tools"><label className="search"><Icon name="search" size={18}/><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="내 악보 검색"/></label><div className="filters"><button className="active">전체</button><button>즐겨찾기</button><button>최근 연주</button><button>폴더</button></div><select value={sort} onChange={(e) => setSort(e.target.value)}><option value="recent">최근 추가순</option><option value="title">곡명순</option></select></div>
     <div className="score-table"><div className="table-head"><span>곡명</span><span>형식</span><span>페이지</span><span>추가일</span><i/></div>{filtered.map((item) => <ScoreCard key={item.id} item={item} table/>)}</div>
     {!filtered.length && <div className="empty">검색 결과가 없습니다.</div>}
@@ -269,5 +292,5 @@ export function App() {
   useEffect(() => { const onHash = () => setView(currentRoute()); addEventListener("hashchange", onHash); if (!location.hash) go("home"); return () => removeEventListener("hashchange", onHash); }, []);
   const id = new URLSearchParams(location.hash.split("?")[1] || "").get("id"); const selected = scores.find((item) => item.id === id) ?? scores[0]!;
   if (view === "player") return <Player item={selected} settings={settings}/>;
-  return <div className="app"><Header view={view}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
+  return <div className="app"><Header view={view}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores} onImported={() => setRefresh((v) => v + 1)}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
 }

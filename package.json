@@ -3,9 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "files": [
+    "src",
+    "scripts",
+    "public/omr-loader.js",
+    "public/omr-worker-core.js",
+    "index.html",
+    "vite.config.ts",
+    "tsconfig.json",
+    "README.md",
+    "OPEN_SOURCE_NOTICE.md"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "source:pack": "node scripts/pack-source.mjs",
+    "omr:vendor": "node scripts/vendor-omr.mjs",
+    "build": "npm run source:pack && tsc --noEmit -p tsconfig.json && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"
