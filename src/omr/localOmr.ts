@@ -167,34 +167,36 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let setupPercent = 2;
   let setupCeiling = 8;
   let setupText = "무료 인식 엔진 시작 중";
+  let engineReady = false;
+  let pdfRendered = false;
   let pageIndex = 0;
   let totalPages = 1;
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
-  const emitProgress = (percent: number, message?: string, nextSetupPct?: number, nextSetupText?: string, nextCeiling?: number) => {
-    currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
+  const emitProgress = (percent?: number, message?: string, nextSetupPct?: number, nextSetupText?: string, nextCeiling?: number) => {
+    if (percent !== undefined) currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
     if (nextCeiling !== undefined) setupCeiling = Math.max(setupCeiling, nextCeiling);
     if (nextSetupPct !== undefined) setupPercent = Math.max(setupPercent, Math.min(100, Math.round(nextSetupPct)));
     if (nextSetupText) setupText = nextSetupText;
-    onProgress(currentPercent, currentMessage, { setupPercent, setupText });
+    onProgress(currentPercent, currentMessage, engineReady ? undefined : { setupPercent, setupText });
   };
 
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
     if (data.type === "ready") {
+      engineReady = true;
       setupPercent = 100;
       setupCeiling = 100;
-      setupText = "무료 인식 엔진 설치 및 준비 완료";
-      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다", 100, "무료 인식 엔진 설치 및 준비 완료", 100);
+      emitProgress(15, "악보 분석 시작 중");
       readyResolve();
     } else if (data.type === "progress" && data.stage === "setup") {
       const sp = data.percent ?? setupPercent;
       const st = data.detail ?? "무료 인식 엔진 준비 중";
-      const overall = 14 + Math.round((sp / 100) * 35);
-      // Allow gentle ticking only up to the next sub-step (+4%), never all the way to 98%
-      emitProgress(overall, st, sp, st, Math.min(50, sp + 4));
+      const mainMsg = pdfRendered ? "무료 인식 엔진 설치 대기 중" : undefined;
+      // Top gauge stays steady while bottom setup gauge advances
+      emitProgress(undefined, mainMsg, sp, st, Math.min(50, sp + 4));
     } else if (data.type === "progress" && data.stage === "download") {
       downloads.set(data.name ?? "model", data.loaded ?? 0);
       const loaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
@@ -202,13 +204,14 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
       const ratio = Math.min(1, loaded / total);
       const sp = 50 + Math.round(ratio * 49);
       const st = `신경망 모델 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
-      emitProgress(30 + ratio * 19, st, sp, st, sp);
+      const mainMsg = pdfRendered ? "무료 인식 엔진 설치 대기 중" : undefined;
+      emitProgress(undefined, mainMsg, sp, st, sp);
     } else if (data.type === "progress" && data.stage === "retry") {
       const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
-      emitProgress(currentPercent, st, setupPercent, st);
+      emitProgress(undefined, undefined, setupPercent, st);
     } else if (data.type === "progress" && data.stage === "infer") {
-      const pageSpan = 44 / Math.max(1, totalPages);
-      const pageBase = 50 + pageIndex * pageSpan;
+      const pageSpan = 79 / Math.max(1, totalPages);
+      const pageBase = 15 + pageIndex * pageSpan;
       const prefix = `악보 ${pageIndex + 1}/${totalPages}쪽`;
       if (data.step === "session") {
         const sub = ((data.index ?? 1) / Math.max(1, data.total ?? 3)) * 0.15;
@@ -252,14 +255,15 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
-  // Tick strictly within the current active stage ceiling so numbers never falsely jump to 98%
+  // While engine is installing, only tick the bottom setup gauge; once engine is ready, tick the top conversion gauge
   const ticker = setInterval(() => {
-    if (setupPercent < setupCeiling) {
-      setupPercent += 1;
-      const overall = Math.max(currentPercent, 14 + Math.round((setupPercent / 100) * 35));
-      emitProgress(overall);
-    } else if (currentPercent >= 50) {
-      const pageCeiling = Math.min(93, 50 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 44));
+    if (!engineReady) {
+      if (setupPercent < setupCeiling) {
+        setupPercent += 1;
+        emitProgress();
+      }
+    } else {
+      const pageCeiling = Math.min(93, 15 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 79));
       if (currentPercent < pageCeiling) {
         emitProgress(currentPercent + 1);
       }
@@ -270,22 +274,21 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     emitProgress(3, "PDF를 기기에서 여는 중", 3, "무료 인식 엔진 시작 중", 8);
     worker.postMessage({ type: "init" });
     const images = await renderPdf(file, (pct, msg) => {
-      // Only update main message if worker hasn't already advanced past PDF rendering
-      if (currentPercent < 15) emitProgress(pct, msg);
-      else emitProgress(pct);
+      emitProgress(pct, msg);
     });
+    pdfRendered = true;
     totalPages = Math.max(1, images.length);
-    if (currentPercent <= 15) {
-      emitProgress(15, setupText !== "무료 인식 엔진 시작 중" ? setupText : "무료 인식 엔진 준비 중 · 첫 실행은 시간이 걸릴 수 있어요");
+    if (!engineReady) {
+      emitProgress(14, "무료 인식 엔진 설치 대기 중");
     }
     await ready;
     const pages: string[] = [];
     for (let index = 0; index < images.length; index += 1) {
       pageIndex = index;
-      const pageStart = 50 + Math.round((index / totalPages) * 44);
+      const pageStart = 15 + Math.round((index / totalPages) * 79);
       emitProgress(pageStart, `악보 ${index + 1}/${images.length}쪽 분석 시작`);
       pages.push(await recognise(images[index]!));
-      const pageDone = 50 + Math.round(((index + 1) / totalPages) * 44);
+      const pageDone = 15 + Math.round(((index + 1) / totalPages) * 79);
       emitProgress(pageDone, `악보 ${index + 1}/${images.length}쪽 인식 완료`);
     }
     emitProgress(95, "페이지를 하나의 MusicXML로 합치는 중");

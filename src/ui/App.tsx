@@ -215,6 +215,9 @@ function Upload({ onSaved }: { onSaved: () => void }) {
             if (details) {
               setSetupProgress(details.setupPercent);
               setSetupText(details.setupText);
+            } else {
+              setSetupProgress(null);
+              setSetupText("");
             }
           })
         : await readScoreFile(selected);
