@@ -132,16 +132,18 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let currentPercent = 2;
   let currentMessage = "PDF를 기기에서 여는 중";
   let setupPercent = 2;
-  let setupText = "무료 인식 엔진 초기화 대기 중";
+  let setupCeiling = 8;
+  let setupText = "무료 인식 엔진 시작 중";
   let pageIndex = 0;
   let totalPages = 1;
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
 
-  const emitProgress = (percent: number, message?: string, nextSetupPct?: number, nextSetupText?: string) => {
+  const emitProgress = (percent: number, message?: string, nextSetupPct?: number, nextSetupText?: string, nextCeiling?: number) => {
     currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
+    if (nextCeiling !== undefined) setupCeiling = Math.max(setupCeiling, nextCeiling);
     if (nextSetupPct !== undefined) setupPercent = Math.max(setupPercent, Math.min(100, Math.round(nextSetupPct)));
     if (nextSetupText) setupText = nextSetupText;
     onProgress(currentPercent, currentMessage, { setupPercent, setupText });
@@ -150,22 +152,24 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
     if (data.type === "ready") {
       setupPercent = 100;
+      setupCeiling = 100;
       setupText = "무료 인식 엔진 설치 및 준비 완료";
-      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다", 100, "무료 인식 엔진 설치 및 준비 완료");
+      emitProgress(50, "인식 준비 완료 · 악보 분석을 시작합니다", 100, "무료 인식 엔진 설치 및 준비 완료", 100);
       readyResolve();
     } else if (data.type === "progress" && data.stage === "setup") {
       const sp = data.percent ?? setupPercent;
       const st = data.detail ?? "무료 인식 엔진 준비 중";
       const overall = 14 + Math.round((sp / 100) * 35);
-      emitProgress(overall, st, sp, st);
+      // Allow gentle ticking only up to the next sub-step (+4%), never all the way to 98%
+      emitProgress(overall, st, sp, st, Math.min(50, sp + 4));
     } else if (data.type === "progress" && data.stage === "download") {
       downloads.set(data.name ?? "model", data.loaded ?? 0);
       const loaded = [...downloads.values()].reduce((sum, bytes) => sum + bytes, 0);
       const total = Math.max(1, data.total ?? 157482318);
       const ratio = Math.min(1, loaded / total);
       const sp = 50 + Math.round(ratio * 49);
-      const st = `신경망 모델 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB (${Math.round(ratio * 100)}%)`;
-      emitProgress(30 + ratio * 19, st, sp, st);
+      const st = `신경망 모델 다운로드 중 · ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
+      emitProgress(30 + ratio * 19, st, sp, st, sp);
     } else if (data.type === "progress" && data.stage === "retry") {
       const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
       emitProgress(currentPercent, st, setupPercent, st);
@@ -215,21 +219,22 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
-  // Smoothly tick both setup gauge and overall gauge during long WASM/network blocks
+  // Tick strictly within the current active stage ceiling so numbers never falsely jump to 98%
   const ticker = setInterval(() => {
-    if (setupPercent < 98) {
+    if (setupPercent < setupCeiling) {
       setupPercent += 1;
+      const overall = Math.max(currentPercent, 14 + Math.round((setupPercent / 100) * 35));
+      emitProgress(overall);
+    } else if (currentPercent >= 50) {
+      const pageCeiling = Math.min(93, 50 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 44));
+      if (currentPercent < pageCeiling) {
+        emitProgress(currentPercent + 1);
+      }
     }
-    const ceiling = currentPercent < 50 ? 48 : Math.min(93, 50 + Math.round(((pageIndex + 0.92) / Math.max(1, totalPages)) * 44));
-    if (currentPercent < ceiling) {
-      emitProgress(currentPercent + 1);
-    } else {
-      onProgress(currentPercent, currentMessage, { setupPercent, setupText });
-    }
-  }, 800);
+  }, 1200);
 
   try {
-    emitProgress(3, "PDF를 기기에서 여는 중", 4, "무료 인식 엔진 시작 중");
+    emitProgress(3, "PDF를 기기에서 여는 중", 3, "무료 인식 엔진 시작 중", 8);
     worker.postMessage({ type: "init" });
     const images = await renderPdf(file, (pct, msg) => {
       // Only update main message if worker hasn't already advanced past PDF rendering

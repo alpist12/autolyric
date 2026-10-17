@@ -322,31 +322,42 @@ async function init() {
   if (typeof WebAssembly.Suspending !== "function") {
     throw new Error("This browser lacks WebAssembly JSPI. Use an up-to-date Chrome.");
   }
-  post({ type: "progress", stage: "setup", percent: 5, detail: "WebAssembly 추론 엔진(ONNX) 불러오는 중" });
+  post({ type: "progress", stage: "setup", percent: 4, detail: "WebAssembly 추론 엔진(ONNX) 불러오는 중" });
   ort = await import(ORT_URL + "ort.webgpu.min.mjs");
   ort.env.wasm.wasmPaths = ORT_URL;
   ort.env.wasm.numThreads = self.crossOriginIsolated
     ? Math.min(4, navigator.hardwareConcurrency || 1)
     : 1;
   post({ type: "log", msg: `WASM threads: ${ort.env.wasm.numThreads}` });
-  post({ type: "progress", stage: "setup", percent: 10, detail: "Pyodide 런타임 모듈 불러오는 중" });
+  post({ type: "progress", stage: "setup", percent: 9, detail: "Pyodide 런타임 모듈 불러오는 중" });
   const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
-  useGpu = !!(self.navigator.gpu && (await navigator.gpu.requestAdapter()));
+  post({ type: "progress", stage: "setup", percent: 12, detail: "기기 그래픽 가속(WebGPU) 지원 확인 중" });
+  try {
+    useGpu = !!(
+      self.navigator.gpu &&
+      (await Promise.race([
+        navigator.gpu.requestAdapter(),
+        sleep(2500).then(() => null),
+      ]))
+    );
+  } catch {
+    useGpu = false;
+  }
 
-  post({ type: "progress", stage: "setup", percent: 15, detail: "Python 가상환경 초기화 중" });
+  post({ type: "progress", stage: "setup", percent: 15, detail: "Python 가상환경 초기화 중 (약 10~20초 소요)" });
   pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
   pyodide.setStderr({ batched: (msg) => post({ type: "log", msg }) });
   pyodide.setStdout({ batched: (msg) => post({ type: "log", msg }) });
 
   const pkgs = [
-    ["typing-extensions", "기본 타입 확장 모듈", 20],
-    ["numpy", "수치 연산 엔진 (NumPy)", 26],
-    ["pillow", "이미지 처리 엔진 (Pillow)", 32],
-    ["opencv-python", "컴퓨터 비전 엔진 (OpenCV)", 40],
+    ["typing-extensions", "기본 타입 확장 모듈", 22],
+    ["numpy", "수치 연산 엔진 (NumPy)", 28],
+    ["pillow", "이미지 처리 엔진 (Pillow)", 34],
+    ["opencv-python", "컴퓨터 비전 엔진 (OpenCV)", 42],
   ];
   for (let i = 0; i < pkgs.length; i++) {
     const [pkg, label, pct] = pkgs[i];
-    post({ type: "progress", stage: "setup", percent: pct - 3, detail: `패키지 설치 중 (${i + 1}/${pkgs.length}) · ${label}` });
+    post({ type: "progress", stage: "setup", percent: pct - 4, detail: `패키지 설치 중 (${i + 1}/${pkgs.length}) · ${label}` });
     await pyodide.loadPackage([pkg]);
     post({ type: "progress", stage: "setup", percent: pct, detail: `패키지 설치 완료 (${i + 1}/${pkgs.length}) · ${label}` });
   }
@@ -355,7 +366,7 @@ async function init() {
   pyodide.FS.mkdirTree(lib);
   // Same deploy version as this worker (?v=… from scripts/stamp-version.mjs).
   const v = "";
-  post({ type: "progress", stage: "setup", percent: 43, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
+  post({ type: "progress", stage: "setup", percent: 45, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
   const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
   pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
   const version = new URLSearchParams(v).get("v");
@@ -369,12 +380,12 @@ async function init() {
     if (!mine(text)) throw new Error("The music reader didn't update. Reload Partsong (twice if needed) and try again.");
     pyodide.FS.writeFile(`${lib}/${f}`, text);
   }
-  post({ type: "progress", stage: "setup", percent: 46, detail: "Python 악보 인식 모듈 컴파일 중" });
+  post({ type: "progress", stage: "setup", percent: 48, detail: "Python 악보 인식 모듈 컴파일 중" });
   pyodide.runPython(`import sys; sys.path.insert(0, "${lib}")`);
   recognise = pyodide.pyimport("runner").recognise;
   recogniseProfiled = pyodide.pyimport("runner").recognise_profiled;
 
-  post({ type: "progress", stage: "setup", percent: 50, detail: "신경망 모델(157MB) 다운로드 확인 중" });
+  post({ type: "progress", stage: "setup", percent: 50, detail: "신경망 모델(157.5MB) 다운로드 시작" });
   for (const name of MODELS) {
     await downloadModel(name);
   }
