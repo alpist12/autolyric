@@ -3,7 +3,7 @@ import { MicrophonePitchSource } from "../audio/MicrophonePitchSource";
 import { PracticeAudio } from "../audio/PracticeAudio";
 import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
-import { convertPdfLocally } from "../omr/localOmr";
+import { convertPdfLocally, formatLocalOmrError, getPdfPageCount, renderPdfPageToCanvas } from "../omr/localOmr";
 import { retainSelectedFile } from "./retainSelectedFile";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
@@ -122,6 +122,48 @@ async function readScoreFile(file: File): Promise<string> {
   throw new Error("자동 악보 추적은 MusicXML(.xml, .musicxml, .mxl) 파일을 지원합니다.");
 }
 
+function PdfPreviewPane({ file, page, pageCount, onPageChange }: { file: File; page: number; pageCount: number; onPageChange: (next: number) => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [rendering, setRendering] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setRendering(true);
+    void renderPdfPageToCanvas(file, page, canvas)
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setRendering(false); });
+    return () => { cancelled = true; };
+  }, [file, page]);
+
+  return <section className="upload-preview-pane" aria-label="악보 미리보기">
+    <header className="preview-toolbar">
+      <div className="preview-title">
+        <strong>악보 보기</strong>
+        <small>{file.name}</small>
+      </div>
+      <div className="preview-pager">
+        <button type="button" className="secondary" disabled={page <= 1} onClick={() => onPageChange(Math.max(1, page - 1))}>← 이전 쪽</button>
+        <span className="page-indicator">{page} / {pageCount}쪽</span>
+        <button type="button" className="secondary" disabled={page >= pageCount} onClick={() => onPageChange(Math.min(pageCount, page + 1))}>다음 쪽 →</button>
+      </div>
+    </header>
+    <div className="preview-canvas-stage">
+      {rendering && <span className="preview-loading-badge">페이지 불러오는 중…</span>}
+      <canvas ref={canvasRef} className="preview-canvas" onClick={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const isRightHalf = e.clientX - rect.left > rect.width / 2;
+        if (isRightHalf && page < pageCount) onPageChange(page + 1);
+        else if (!isRightHalf && page > 1) onPageChange(page - 1);
+      }} title="왼쪽/오른쪽을 터치해 페이지를 넘길 수 있습니다" />
+    </div>
+    <footer className="preview-footer">
+      <small>악보 좌우 영역을 터치하거나 상단 버튼으로 페이지를 넘겨 바로 연주하거나 확인하실 수 있습니다.</small>
+    </footer>
+  </section>;
+}
+
 function Upload({ onSaved }: { onSaved: () => void }) {
   const input = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -132,6 +174,9 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
+  const [pdfPage, setPdfPage] = useState(1);
+  const [pdfPageCount, setPdfPageCount] = useState(1);
+
   const handle = async (file?: File, confirmed = false) => {
     if (!file) return;
     let selected = file;
@@ -146,7 +191,18 @@ function Upload({ onSaved }: { onSaved: () => void }) {
     }
     const isPdf = selected.name.toLowerCase().endsWith(".pdf");
     if (isPdf && !confirmed) {
-      setPendingPdf(selected); setFileName(selected.name); setError(""); return;
+      setPendingPdf(selected);
+      setFileName(selected.name);
+      setPdfPage(1);
+      setPdfPageCount(1);
+      setError("");
+      try {
+        const count = await getPdfPageCount(selected);
+        setPdfPageCount(Math.max(1, count));
+      } catch (reason) {
+        setError(formatLocalOmrError(reason).message);
+      }
+      return;
     }
     if (!isPdf) setPendingPdf(null);
     setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setSetupProgress(isPdf ? 2 : null); setSetupText(isPdf ? "무료 인식 엔진 시작 대기 중" : ""); setFileName(selected.name); setError("");
@@ -169,15 +225,76 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       setPendingPdf(null); setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); setSetupProgress(null); }
   };
-  return <main className="page upload-page">
-    <div className="page-heading"><h1>악보를 업로드하세요</h1><p>PDF는 MusicXML로 변환하고, 기존 MusicXML은 바로 연주 모드로 엽니다.</p></div>
-    <div className={`drop-zone${pendingPdf ? " has-file" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e: DragEvent) => { e.preventDefault(); void handle(e.dataTransfer.files[0]); }}>
-      <span className="drop-icon"><Icon name="upload" size={30}/></span><h2>{pendingPdf ? "PDF 파일을 불러왔습니다" : "파일을 이곳에 끌어다 놓으세요"}</h2><p>{pendingPdf ? pendingPdf.name : "PDF(.pdf) · MusicXML(.xml, .musicxml, .mxl)"}</p>
-      <button className="primary" onClick={() => input.current?.click()}>{pendingPdf ? "다른 파일 선택" : "파일 선택"}</button><input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => { void handle(e.target.files?.[0]); }}/>{pendingPdf ? <small className="file-selected-status">✓ 선택 완료 · {(pendingPdf.size / 1024 / 1024).toFixed(1)}MB</small> : <small>PDF 20MB · MusicXML 50MB 이하</small>}
-    </div>
-    {pendingPdf && !busy && <section className="omr-connect"><div><strong>기기에서 무료 변환</strong><p>PDF는 서버로 보내지 않고 이 브라우저에서 MusicXML로 바꿉니다. 첫 변환 때만 약 157MB 인식 모델을 받으며 이후에는 기기에 캐시됩니다.</p></div><div><a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 · AGPL-3.0</a><button className="primary" onClick={() => void handle(pendingPdf, true)}>무료 변환 시작</button></div><small>최신 Chrome·Edge 권장 · 인쇄 악보용 · 변환 중 탭을 닫지 마세요. <a href="source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a></small></section>}
-    {busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><div className="gauge-group"><div className="gauge-header"><span>전체 변환 진행률 · {progressText}</span><b>{progress}%</b></div><i><b style={{ width: `${progress}%` }}/></i></div>{setupProgress !== null && <div className={`gauge-group setup-gauge${setupProgress >= 100 ? " done" : ""}`}><div className="gauge-header"><span>{setupProgress >= 100 ? "✓ 무료 인식 엔진 설치 완료" : `엔진 및 AI 모델 설치 게이지 · ${setupText}`}</span><b>{setupProgress}%</b></div><i><b style={{ width: `${setupProgress}%` }}/></i></div>}</div></div>}
-    {error && <div className="notice error">{error}</div>}
+
+  return <main className={`page upload-page${pendingPdf ? " split-mode" : ""}`}>
+    <div className="page-heading"><h1>악보를 업로드하세요</h1><p>PDF를 올리면 왼쪽에서 바로 악보를 넘겨 볼 수 있고, 오른쪽에서 MusicXML 변환을 진행할 수 있습니다.</p></div>
+    <input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => { void handle(e.target.files?.[0]); }}/>
+    {!pendingPdf ? (
+      <div className="drop-zone" onDragOver={(e) => e.preventDefault()} onDrop={(e: DragEvent) => { e.preventDefault(); void handle(e.dataTransfer.files[0]); }}>
+        <span className="drop-icon"><Icon name="upload" size={30}/></span>
+        <h2>파일을 이곳에 끌어다 놓으세요</h2>
+        <p>PDF(.pdf) · MusicXML(.xml, .musicxml, .mxl)</p>
+        <button className="primary" onClick={() => input.current?.click()}>파일 선택</button>
+        <small>PDF 20MB · MusicXML 50MB 이하</small>
+      </div>
+    ) : (
+      <div className="upload-workspace">
+        <PdfPreviewPane file={pendingPdf} page={pdfPage} pageCount={pdfPageCount} onPageChange={setPdfPage} />
+        <aside className="upload-convert-panel">
+          <div className="convert-file-card">
+            <div className="convert-file-info">
+              <span className="file-icon"><Icon name="music" size={22}/></span>
+              <div>
+                <strong>{pendingPdf.name}</strong>
+                <small>✓ 선택 완료 · {(pendingPdf.size / 1024 / 1024).toFixed(1)}MB · 총 {pdfPageCount}쪽</small>
+              </div>
+            </div>
+            <button type="button" className="secondary" disabled={busy} onClick={() => input.current?.click()}>다른 파일 선택</button>
+          </div>
+
+          <section className="convert-action-card">
+            <div>
+              <strong>자동 추적용 파일 변환 (PDF → MusicXML)</strong>
+              <p>왼쪽 화면에서 원본 PDF 악보를 넘기며 바로 보실 수 있습니다. 마이크 자동 페이지 넘김 기능을 쓰려면 아래 버튼을 눌러 변환을 시작하세요.</p>
+            </div>
+            {!busy ? (
+              <button type="button" className="primary convert-start-btn" onClick={() => void handle(pendingPdf, true)}>
+                파일 변환하기
+              </button>
+            ) : (
+              <div className="upload-progress inline" role="status" aria-live="polite">
+                <div className="progress-top-row">
+                  <span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span>
+                  <div>
+                    <strong>변환 진행 중…</strong>
+                    <small>변환하는 동안에도 왼쪽 악보를 넘겨 볼 수 있습니다.</small>
+                  </div>
+                </div>
+                <div className="gauge-group">
+                  <div className="gauge-header"><span>전체 변환 진행률 · {progressText}</span><b>{progress}%</b></div>
+                  <i><b style={{ width: `${progress}%` }}/></i>
+                </div>
+                {setupProgress !== null && (
+                  <div className={`gauge-group setup-gauge${setupProgress >= 100 ? " done" : ""}`}>
+                    <div className="gauge-header">
+                      <span>{setupProgress >= 100 ? "✓ 무료 인식 엔진 설치 완료" : `엔진 및 AI 모델 설치 게이지 · ${setupText}`}</span>
+                      <b>{setupProgress}%</b>
+                    </div>
+                    <i><b style={{ width: `${setupProgress}%` }}/></i>
+                  </div>
+                )}
+              </div>
+            )}
+            <small className="convert-meta-note">
+              첫 변환 시 약 157MB 인식 모델을 기기에 캐시합니다 · <a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 AGPL-3.0</a> · <a href="source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a>
+            </small>
+          </section>
+          {error && <div className="notice error">{error}</div>}
+        </aside>
+      </div>
+    )}
+    {!pendingPdf && busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><div className="gauge-group"><div className="gauge-header"><span>{progressText}</span><b>{progress}%</b></div><i><b style={{ width: `${progress}%` }}/></i></div></div></div>}
+    {!pendingPdf && error && <div className="notice error">{error}</div>}
   </main>;
 }
 

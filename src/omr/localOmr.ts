@@ -93,6 +93,39 @@ export function mergeMusicXmlPages(pages: string[]): string {
   return new XMLSerializer().serializeToString(target);
 }
 
+export async function getPdfPageCount(file: File): Promise<number> {
+  ensurePdfjsPolyfills();
+  const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
+  pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
+  const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const doc = await task.promise;
+  try {
+    return doc.numPages;
+  } finally {
+    await task.destroy();
+  }
+}
+
+export async function renderPdfPageToCanvas(file: File, pageNumber: number, canvas: HTMLCanvasElement, maxWidth = 1080): Promise<void> {
+  ensurePdfjsPolyfills();
+  const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
+  pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
+  const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const doc = await task.promise;
+  try {
+    const page = await doc.getPage(Math.min(Math.max(1, pageNumber), doc.numPages));
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(maxWidth / base.width, 2.2);
+    const viewport = page.getViewport({ scale });
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    await page.render({ canvas, viewport, background: "#ffffff" }).promise;
+    page.cleanup();
+  } finally {
+    await task.destroy();
+  }
+}
+
 async function renderPdf(file: File, onProgress: (pct: number, msg: string) => void): Promise<ArrayBuffer[]> {
   ensurePdfjsPolyfills();
   const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
