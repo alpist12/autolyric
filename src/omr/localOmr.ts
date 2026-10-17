@@ -3,6 +3,15 @@ const MAX_PDF_BYTES = 20 * 1024 * 1024;
 
 export type OmrProgress = (percent: number, message: string) => void;
 
+export function formatLocalOmrError(reason: unknown): Error {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  if (/invalid (?:root reference|pdf structure)/i.test(message)) {
+    return new Error("PDF 내부 구조가 손상되었거나 표준 형식이 아닙니다. 브라우저에서 인쇄 → PDF로 저장한 새 파일을 다시 선택해 주세요.");
+  }
+  if (/WebAssembly JSPI/i.test(message)) return new Error("무료 변환은 최신 Chrome 또는 Edge가 필요합니다.");
+  return reason instanceof Error ? reason : new Error(message);
+}
+
 type WorkerMessage =
   | { type: "progress"; stage: string; name?: string; loaded?: number; total?: number; attempt?: number }
   | { type: "ready" }
@@ -130,9 +139,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     onProgress(94, "페이지를 하나의 MusicXML로 합치는 중");
     return mergeMusicXmlPages(pages);
   } catch (reason) {
-    const message = reason instanceof Error ? reason.message : String(reason);
-    if (/WebAssembly JSPI/i.test(message)) throw new Error("무료 변환은 최신 Chrome 또는 Edge가 필요합니다.");
-    throw reason;
+    throw formatLocalOmrError(reason);
   } finally {
     worker.terminate();
   }

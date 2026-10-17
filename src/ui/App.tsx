@@ -131,10 +131,12 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
   const handle = async (file?: File, confirmed = false) => {
     if (!file) return;
-    if (file.name.toLowerCase().endsWith(".pdf") && !confirmed) {
+    const isPdf = file.name.toLowerCase().endsWith(".pdf");
+    if (isPdf && !confirmed) {
       setPendingPdf(file); setFileName(file.name); setError(""); return;
     }
-    setPendingPdf(null); setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setFileName(file.name); setError("");
+    if (!isPdf) setPendingPdf(null);
+    setBusy(true); setProgress(2); setProgressText("파일을 불러오는 중"); setFileName(file.name); setError("");
     try {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const xml = file.name.toLowerCase().endsWith(".pdf")
@@ -144,14 +146,14 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       const score = parseMusicXml(xml);
       const savedName = file.name.toLowerCase().endsWith(".pdf") ? file.name.replace(/\.pdf$/i, ".musicxml") : file.name;
       await library.save({ id: score.id, name: savedName, xml, score, savedAt: Date.now() });
-      setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
+      setPendingPdf(null); setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); }
   };
   return <main className="page upload-page">
     <div className="page-heading"><h1>악보를 업로드하세요</h1><p>PDF는 MusicXML로 변환하고, 기존 MusicXML은 바로 연주 모드로 엽니다.</p></div>
-    <div className="drop-zone" onDragOver={(e) => e.preventDefault()} onDrop={(e: DragEvent) => { e.preventDefault(); void handle(e.dataTransfer.files[0]); }}>
-      <span className="drop-icon"><Icon name="upload" size={30}/></span><h2>파일을 이곳에 끌어다 놓으세요</h2><p>PDF(.pdf) · MusicXML(.xml, .musicxml, .mxl)</p>
-      <button className="primary" onClick={() => input.current?.click()}>파일 선택</button><input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => void handle(e.target.files?.[0])}/><small>PDF 20MB · MusicXML 50MB 이하</small>
+    <div className={`drop-zone${pendingPdf ? " has-file" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e: DragEvent) => { e.preventDefault(); void handle(e.dataTransfer.files[0]); }}>
+      <span className="drop-icon"><Icon name="upload" size={30}/></span><h2>{pendingPdf ? "PDF 파일을 불러왔습니다" : "파일을 이곳에 끌어다 놓으세요"}</h2><p>{pendingPdf ? pendingPdf.name : "PDF(.pdf) · MusicXML(.xml, .musicxml, .mxl)"}</p>
+      <button className="primary" onClick={() => input.current?.click()}>{pendingPdf ? "다른 파일 선택" : "파일 선택"}</button><input ref={input} hidden type="file" accept=".pdf,.xml,.musicxml,.mxl" onChange={(e: ChangeEvent<HTMLInputElement>) => { const file = e.target.files?.[0]; e.target.value = ""; void handle(file); }}/>{pendingPdf ? <small className="file-selected-status">✓ 선택 완료 · {(pendingPdf.size / 1024 / 1024).toFixed(1)}MB</small> : <small>PDF 20MB · MusicXML 50MB 이하</small>}
     </div>
     {pendingPdf && !busy && <section className="omr-connect"><div><strong>기기에서 무료 변환</strong><p>PDF는 서버로 보내지 않고 이 브라우저에서 MusicXML로 바꿉니다. 첫 변환 때만 약 157MB 인식 모델을 받으며 이후에는 기기에 캐시됩니다.</p></div><div><a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 · AGPL-3.0</a><button className="primary" onClick={() => void handle(pendingPdf, true)}>무료 변환 시작</button></div><small>최신 Chrome·Edge 권장 · 인쇄 악보용 · 변환 중 탭을 닫지 마세요. <a href="/source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a></small></section>}
     {busy && <div className="upload-progress" role="status" aria-live="polite"><span className="loading-orbit" aria-hidden="true"><i/><b/><em/></span><div><strong>{fileName}</strong><span>{progressText} · {progress}%</span><i><b style={{ width: `${progress}%` }}/></i></div></div>}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
-import { mergeMusicXmlPages } from "./localOmr";
+import { formatLocalOmrError, mergeMusicXmlPages } from "./localOmr";
 
 Object.assign(globalThis, { DOMParser, XMLSerializer });
 
@@ -18,5 +18,12 @@ describe("mergeMusicXmlPages", () => {
   it("rejects pages whose part layout changed", () => {
     const empty = `<?xml version="1.0"?><score-partwise><part-list/></score-partwise>`;
     expect(() => mergeMusicXmlPages([page("C"), empty])).toThrow("파트 수가 달라");
+  });
+});
+
+describe("formatLocalOmrError", () => {
+  it("turns a broken PDF root error into a useful recovery instruction", () => {
+    expect(formatLocalOmrError(new Error("Invalid root reference")).message).toContain("인쇄 → PDF로 저장");
+    expect(formatLocalOmrError(new Error("Invalid PDF structure.")).message).toContain("인쇄 → PDF로 저장");
   });
 });
