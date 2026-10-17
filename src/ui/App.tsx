@@ -5,6 +5,7 @@ import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
 import { convertPdfLocally } from "../omr/localOmr";
 import { retainSelectedFile } from "./retainSelectedFile";
+import { ACCESS_STORAGE_KEY, ACCESS_TOKEN, buildInviteUrl, checkAndPersistAccess, verifyAccessKey } from "./accessGate";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
 import { ScoreLibrary } from "../storage/ScoreLibrary";
@@ -218,14 +219,25 @@ function useSettings() {
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) { return <button role="switch" aria-checked={checked} className={`toggle ${checked ? "on" : ""}`} onClick={() => onChange(!checked)}><i/></button>; }
 
 function Settings({ settings, setSettings }: { settings: SettingsState; setSettings: (next: SettingsState) => void }) {
+  const [copied, setCopied] = useState(false);
   const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => setSettings({ ...settings, [key]: value });
+  const copyInvite = async () => {
+    try {
+      await navigator.clipboard.writeText(buildInviteUrl());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard API unavailable
+    }
+  };
   return <main className="page settings-page"><div className="page-heading"><h1>설정</h1></div><div className="settings-layout">
-    <aside>{["악기", "악보 표시", "오디오", "접근성"].map((item, i) => <a key={item} href={`#setting-${i}`} className={i === 0 ? "active" : ""}>{item}</a>)}</aside>
+    <aside>{["악기", "악보 표시", "오디오", "접근성", "초대 링크"].map((item, i) => <a key={item} href={`#setting-${i}`} className={i === 0 ? "active" : ""}>{item}</a>)}</aside>
     <div className="settings-content">
       <section id="setting-0"><h2>악기</h2><p>밴드 파트에 맞춰 음정 인식 방식과 전처리를 조정합니다.</p><div className="instrument-grid">{["보컬", "기타", "베이스", "키보드", "바이올린", "플루트", "색소폰", "트럼펫"].map((item) => <button key={item} className={settings.instrument === item ? "selected" : ""} onClick={() => update("instrument", item)}><Icon name="music"/><span>{item}</span>{settings.instrument === item && <Icon name="check"/>}</button>)}</div><p className="instrument-note">드럼처럼 음높이가 없는 파트는 현재 자동 위치 추적 대상이 아닙니다.</p></section>
       <section id="setting-1"><h2>악보 표시</h2><SettingRow label="보기 방식"><select value={settings.view} onChange={(e) => update("view", e.target.value)}><option value="auto">한 페이지 자동 (기기에 맞춤)</option><option value="single">한 페이지</option><option value="double">두 페이지</option></select></SettingRow><SettingRow label="자동 페이지 넘김"><Toggle checked={settings.autoTurn} onChange={(v) => update("autoTurn", v)}/></SettingRow><SettingRow label="자동 스크롤"><Toggle checked={settings.autoScroll} onChange={(v) => update("autoScroll", v)}/></SettingRow><SettingRow label={`확대 비율 ${settings.zoom}%`}><input type="range" min="70" max="140" value={settings.zoom} onChange={(e) => update("zoom", Number(e.target.value))}/></SettingRow><SettingRow label="현재 마디 강조" hint="연주 중인 마디에 파란 커서를 표시합니다."><Toggle checked={settings.highlight} onChange={(v) => update("highlight", v)}/></SettingRow></section>
       <section id="setting-2"><h2>오디오 입력</h2><SettingRow label="입력 장치"><select><option>내장 마이크 (기본값)</option><option>USB 오디오 인터페이스</option></select></SettingRow><SettingRow label={`입력 감도 ${settings.sensitivity}%`} hint="주변 소음 낮음 · 인식에 적합"><input type="range" value={settings.sensitivity} onChange={(e) => update("sensitivity", Number(e.target.value))}/></SettingRow></section>
       <section id="setting-3"><h2>접근성</h2><SettingRow label="고대비 표시"><Toggle checked={settings.highContrast} onChange={(v) => update("highContrast", v)}/></SettingRow><SettingRow label="큰 연주 컨트롤"><Toggle checked={settings.largeControls} onChange={(v) => update("largeControls", v)}/></SettingRow></section>
+      <section id="setting-4"><h2>초대 링크</h2><p>초대 링크로 한 번 접속한 기기는 브라우저에 인증 정보가 저장되어 이후 바로 열립니다.</p><SettingRow label="비공개 접속 링크" hint={buildInviteUrl()}><button className="secondary" onClick={() => void copyInvite()}>{copied ? "복사 완료!" : "초대 링크 복사"}</button></SettingRow></section>
     </div>
   </div></main>;
 }
@@ -300,9 +312,43 @@ function Player({ item, settings }: { item: StoredScore; settings: SettingsState
   </div>;
 }
 
+function AccessGate({ onUnlock }: { onUnlock: () => void }) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (verifyAccessKey(code)) {
+      try { localStorage.setItem(ACCESS_STORAGE_KEY, ACCESS_TOKEN); } catch { /* ignore */ }
+      onUnlock();
+    } else {
+      setError("초대 코드가 올바르지 않습니다. 공유받은 전용 링크로 접속해 주세요.");
+    }
+  };
+  return <main className="access-gate">
+    <form className="access-card" onSubmit={submit}>
+      <span className="brand-mark"><Icon name="music" size={20}/></span>
+      <h1>비공개 악보 공간</h1>
+      <p>초대 링크가 있는 사용자만 접속할 수 있습니다.<br/>전용 링크로 접속하거나 초대 코드를 입력해 주세요.</p>
+      <div className="access-input-row">
+        <input type="password" value={code} onChange={(e) => { setCode(e.target.value); setError(""); }} placeholder="초대 코드 입력" autoComplete="off"/>
+        <button type="submit" className="primary">입장</button>
+      </div>
+      {error && <div className="notice error small">{error}</div>}
+    </form>
+  </main>;
+}
+
 export function App() {
+  const [authorized, setAuthorized] = useState<boolean>(() => {
+    const res = checkAndPersistAccess();
+    if (res.cleanedUrl && typeof history !== "undefined") {
+      history.replaceState(null, "", res.cleanedUrl);
+    }
+    return res.authorized;
+  });
   const [view, setView] = useState<View>(currentRoute()); const [refresh, setRefresh] = useState(0); const scores = useScores(refresh); const [settings, setSettings] = useSettings();
   useEffect(() => { const onHash = () => setView(currentRoute()); addEventListener("hashchange", onHash); if (!location.hash) go("home"); return () => removeEventListener("hashchange", onHash); }, []);
+  if (!authorized) return <AccessGate onUnlock={() => setAuthorized(true)}/>;
   const id = new URLSearchParams(location.hash.split("?")[1] || "").get("id"); const selected = scores.find((item) => item.id === id) ?? scores[0]!;
   if (view === "player") return <Player item={selected} settings={settings}/>;
   return <div className="app"><Header view={view}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores} onImported={() => setRefresh((v) => v + 1)}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
