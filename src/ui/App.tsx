@@ -8,7 +8,7 @@ import { retainSelectedFile } from "./retainSelectedFile";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
 import { ScoreLibrary } from "../storage/ScoreLibrary";
-import { createFirebaseSync } from "../sync/FirebaseSync";
+import { createFirebaseSync, mergeScoreSets } from "../sync/FirebaseSync";
 import type { NoteObservation, StoredScore, TrackingState } from "../types";
 import { demoXml } from "./demo";
 
@@ -72,6 +72,7 @@ function useScores(refreshKey = 0) {
   const [syncStatus, setSyncStatus] = useState<"local" | "syncing" | "synced" | "offline">(cloudSync ? "syncing" : "local");
   useEffect(() => {
     let cancelled = false;
+    let stopCloud: (() => void) | undefined;
     void library.list().then(async (stored) => {
       const local = stored.map((item) => ({ ...item, updatedAt: item.updatedAt ?? item.savedAt, note: item.note ?? localStorage.getItem(`scoreflow-note:${item.id}`) ?? "", annotations: item.annotations ?? [] }));
       if (!cancelled) setScores(local);
@@ -81,11 +82,19 @@ function useScores(refreshKey = 0) {
         const merged = await cloudSync.reconcile(local);
         await Promise.all(merged.map((item) => library.save(item)));
         if (!cancelled) { setScores(merged); setSyncStatus("synced"); }
+        stopCloud = await cloudSync.subscribe((remote) => {
+          void library.list().then(async (current) => {
+            const next = mergeScoreSets(current, remote);
+            await Promise.all(next.map((item) => library.save(item)));
+            if (!cancelled) { setScores(next); setSyncStatus("synced"); }
+          }).catch(() => { if (!cancelled) setSyncStatus("offline"); });
+        }, () => { if (!cancelled) setSyncStatus("offline"); });
+        if (cancelled) stopCloud();
       } catch {
         if (!cancelled) setSyncStatus("offline");
       }
     }).catch(() => { if (!cancelled) { setScores([]); setSyncStatus(cloudSync ? "offline" : "local"); } });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; stopCloud?.(); };
   }, [refreshKey]);
   const visibleScores: StoredScore[] = [demoStored, ...scores.filter((item) => item.id !== demoStored.id)];
   return [visibleScores, syncStatus] as const;

@@ -1,6 +1,6 @@
 import { getApp, getApps, initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously } from "firebase/auth";
-import { get, getDatabase, ref, set } from "firebase/database";
+import { get, getDatabase, onValue, ref, set } from "firebase/database";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
 import type { StoredScore } from "../types";
 
@@ -19,6 +19,15 @@ const firebaseConfig = {
 };
 
 type CloudScore = Pick<StoredScore, "id" | "name" | "xml" | "savedAt" | "updatedAt" | "note" | "annotations"> & { displayName?: string };
+
+export function mergeScoreSets(local: StoredScore[], remote: StoredScore[]): StoredScore[] {
+  const merged = new Map(local.map((score) => [score.id, score]));
+  for (const item of remote) {
+    const existing = merged.get(item.id);
+    if (!existing || (item.updatedAt ?? item.savedAt) > (existing.updatedAt ?? existing.savedAt)) merged.set(item.id, item);
+  }
+  return [...merged.values()];
+}
 
 export function retainBandKey(url: URL, storage: Pick<Storage, "getItem" | "setItem">): { key: string; cleanUrl?: string } | null {
   const supplied = url.searchParams.get("key")?.trim();
@@ -60,26 +69,22 @@ export class FirebaseSync {
   async reconcile(localScores: StoredScore[]): Promise<StoredScore[]> {
     await this.authenticate();
     const snapshot = await get(ref(this.database, `bands/${this.bandKey}/scores`));
-    const values = snapshot.val() as Record<string, unknown> | null;
-    const remote = Object.values(values ?? {}).filter(isCloudScore);
+    const remote = this.readRemoteScores(snapshot.val());
     const remoteById = new Map(remote.map((score) => [score.id, score]));
-    const merged = new Map(localScores.map((score) => [score.id, score]));
-
-    for (const item of remote) {
-      const local = merged.get(item.id);
-      if (!local || item.updatedAt! > (local.updatedAt ?? local.savedAt)) {
-        try {
-          merged.set(item.id, { ...item, score: parseMusicXml(item.xml), note: item.note ?? "", annotations: item.annotations ?? [] });
-        } catch {
-          // Ignore malformed remote MusicXML so one bad entry cannot break the library.
-        }
-      }
-    }
     await Promise.all(localScores.map(async (item) => {
       const remoteItem = remoteById.get(item.id);
       if (!remoteItem || (item.updatedAt ?? item.savedAt) > remoteItem.updatedAt!) await this.save(item);
     }));
-    return [...merged.values()];
+    return mergeScoreSets(localScores, remote);
+  }
+
+  async subscribe(onScores: (scores: StoredScore[]) => void, onError: () => void): Promise<() => void> {
+    await this.authenticate();
+    return onValue(
+      ref(this.database, `bands/${this.bandKey}/scores`),
+      (snapshot) => onScores(this.readRemoteScores(snapshot.val())),
+      onError,
+    );
   }
 
   async save(score: StoredScore): Promise<void> {
@@ -100,6 +105,19 @@ export class FirebaseSync {
       throw error;
     });
     return this.authPromise;
+  }
+
+  private readRemoteScores(value: unknown): StoredScore[] {
+    const values = value as Record<string, unknown> | null;
+    const scores: StoredScore[] = [];
+    for (const item of Object.values(values ?? {}).filter(isCloudScore)) {
+      try {
+        scores.push({ ...item, score: parseMusicXml(item.xml), note: item.note ?? "", annotations: item.annotations ?? [] });
+      } catch {
+        // Ignore malformed remote MusicXML so one bad entry cannot break the library.
+      }
+    }
+    return scores;
   }
 }
 
