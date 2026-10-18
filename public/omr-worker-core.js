@@ -37,7 +37,8 @@ const MODEL_SIZES = {
   [MODELS[1]]: 52861122,
   [MODELS[2]]: 47309835,
 };
-const modelUrl = (name) => new URL("models/" + name, "https://partsong.app/").href;
+const modelUrl = (name) => new URL("models/" + name, self.location.href).href;
+const fallbackModelUrl = (name) => new URL("models/" + name, "https://partsong.app/").href;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchWholeModelWithProgress(url, expectedSize, onProgress) {
@@ -91,15 +92,17 @@ async function fetchWholeModelWithProgress(url, expectedSize, onProgress) {
 async function downloadModel(name) {
   const cache = await caches.open(MODEL_CACHE);
   const size = MODEL_SIZES[name];
-  const url = modelUrl(name);
-  if (await cache.match(url)) {
+  const keyUrl = modelUrl(name);
+  if ((await cache.match(keyUrl)) || (await cache.match(fallbackModelUrl(name)))) {
     post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES, cached: true });
     return;
   }
+  let useFallback = false;
   for (let attempt = 1; ; attempt++) {
     try {
       let lastPost = 0;
-      const buf = await fetchWholeModelWithProgress(url, size, (loadedBytes) => {
+      const targetUrl = useFallback ? fallbackModelUrl(name) : keyUrl;
+      const buf = await fetchWholeModelWithProgress(targetUrl, size, (loadedBytes) => {
         const now = performance.now();
         if (now - lastPost >= 100 || loadedBytes >= size) {
           lastPost = now;
@@ -113,10 +116,15 @@ async function downloadModel(name) {
         }
       });
       if (buf.byteLength !== size) throw new Error(`short read (${buf.byteLength}/${size})`);
-      await cache.put(url, new Response(buf));
+      await cache.put(keyUrl, new Response(buf));
       post({ type: "progress", stage: "download", name, loaded: size, total: MODELS_TOTAL_BYTES });
       return;
     } catch (e) {
+      if (!useFallback) {
+        useFallback = true;
+        attempt--;
+        continue;
+      }
       if (attempt >= 6) {
         throw new Error(`모델 다운로드 연결이 불안정합니다 (${e.message}). 와이파이 연결을 확인한 뒤 다시 시도해 주세요.`);
       }
@@ -128,10 +136,10 @@ async function downloadModel(name) {
 
 async function modelBytes(name) {
   const cache = await caches.open(MODEL_CACHE);
-  const whole = await cache.match(modelUrl(name));
+  const whole = (await cache.match(modelUrl(name))) || (await cache.match(fallbackModelUrl(name)));
   if (whole) return new Uint8Array(await whole.arrayBuffer());
   await downloadModel(name);
-  const retryWhole = await cache.match(modelUrl(name));
+  const retryWhole = (await cache.match(modelUrl(name))) || (await cache.match(fallbackModelUrl(name)));
   if (!retryWhole) throw new Error(`model missing in cache: ${name}`);
   return new Uint8Array(await retryWhole.arrayBuffer());
 }
@@ -360,16 +368,13 @@ async function init() {
 
     const lib = "/home/pyodide/lib";
     pyodide.FS.mkdirTree(lib);
-    const v = "";
     post({ type: "progress", stage: "setup", percent: 45, detail: "악보 인식 라이브러리(HOMR) 압축 해제 중" });
-    const homrZip = await (await fetch("https://partsong.app/vendor/homr.zip")).arrayBuffer();
+    const homrUrl = new URL("vendor/homr.zip", self.location.href).href;
+    const homrZip = await (await fetch(homrUrl)).arrayBuffer();
     pyodide.unpackArchive(homrZip, "zip", { extractDir: lib });
-    const version = new URLSearchParams(v).get("v");
     for (const f of ["onnxruntime.py", "runner.py"]) {
-      let text = await (await fetch("https://raw.githubusercontent.com/pzfreo/partsong/18b38f2602ec5a4cf6230ebee391595a4d18d9fd/omr/" + f)).text();
-      const mine = (t) => !version || f !== "runner.py" || t.includes(`VERSION = "${version}"`);
-      if (!mine(text)) text = await (await fetch(`omr/${f}${v}&fresh=${Date.now()}`, { cache: "reload" })).text();
-      if (!mine(text)) throw new Error("The music reader didn't update. Reload Partsong (twice if needed) and try again.");
+      const pyUrl = new URL(`omr/${f}`, self.location.href).href;
+      const text = await (await fetch(pyUrl)).text();
       pyodide.FS.writeFile(`${lib}/${f}`, text);
     }
     post({ type: "progress", stage: "setup", percent: 48, detail: "Python 악보 인식 모듈 컴파일 중" });

@@ -8,6 +8,7 @@ import { retainSelectedFile } from "./retainSelectedFile";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
 import { ScoreLibrary } from "../storage/ScoreLibrary";
+import { createFirebaseSync } from "../sync/FirebaseSync";
 import type { NoteObservation, StoredScore, TrackingState } from "../types";
 import { demoXml } from "./demo";
 
@@ -17,8 +18,9 @@ type View = "home" | "upload" | "library" | "settings" | "player";
 type IconName = "music" | "plus" | "upload" | "mic" | "star" | "play" | "search" | "settings" | "library" | "pause" | "pen" | "chevron" | "grid" | "check" | "speaker" | "metronome";
 
 const library = new ScoreLibrary();
+const cloudSync = createFirebaseSync();
 const demoScore = parseMusicXml(demoXml);
-const demoStored: StoredScore = { id: demoScore.id, name: "월광 소나타 1악장.musicxml", xml: demoXml, score: demoScore, savedAt: Date.now() - 86_400_000 };
+const demoStored: StoredScore = { id: demoScore.id, name: "월광 소나타 1악장.musicxml", xml: demoXml, score: demoScore, savedAt: Date.now() - 86_400_000, note: "", annotations: [] };
 
 const paths: Record<IconName, ReactNode> = {
   music: <><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></>,
@@ -52,7 +54,7 @@ function go(view: View, id?: string) {
   location.hash = `${view}${id ? `?id=${encodeURIComponent(id)}` : ""}`;
 }
 
-function Header({ view }: { view: View }) {
+function Header({ view, syncStatus }: { view: View; syncStatus: "local" | "syncing" | "synced" | "offline" }) {
   return <header className="topbar"><div className="topbar-inner">
     <button className="brand" onClick={() => go("home")}><span className="brand-mark"><Icon name="music" size={18}/></span>ScoreFlow</button>
     <nav aria-label="주 메뉴">
@@ -60,14 +62,38 @@ function Header({ view }: { view: View }) {
       <button className={view === "library" ? "active" : ""} onClick={() => go("library")}>내 악보</button>
       <button className={view === "settings" ? "active" : ""} onClick={() => go("settings")}>설정</button>
     </nav>
+    <span className={`sync-status ${syncStatus}`}>{syncStatus === "syncing" ? "동기화 중" : syncStatus === "synced" ? "클라우드 저장" : syncStatus === "offline" ? "오프라인 저장" : "이 기기에 저장"}</span>
     <button className="primary upload-button" onClick={() => go("upload")}><Icon name="plus" size={18}/>업로드</button>
   </div></header>;
 }
 
 function useScores(refreshKey = 0) {
   const [scores, setScores] = useState<StoredScore[]>([]);
-  useEffect(() => { library.list().then(setScores).catch(() => setScores([])); }, [refreshKey]);
-  return [demoStored, ...scores.filter((item) => item.id !== demoStored.id)];
+  const [syncStatus, setSyncStatus] = useState<"local" | "syncing" | "synced" | "offline">(cloudSync ? "syncing" : "local");
+  useEffect(() => {
+    let cancelled = false;
+    void library.list().then(async (stored) => {
+      const local = stored.map((item) => ({ ...item, updatedAt: item.updatedAt ?? item.savedAt, note: item.note ?? localStorage.getItem(`scoreflow-note:${item.id}`) ?? "", annotations: item.annotations ?? [] }));
+      if (!cancelled) setScores(local);
+      if (!cloudSync) return;
+      setSyncStatus("syncing");
+      try {
+        const merged = await cloudSync.reconcile(local);
+        await Promise.all(merged.map((item) => library.save(item)));
+        if (!cancelled) { setScores(merged); setSyncStatus("synced"); }
+      } catch {
+        if (!cancelled) setSyncStatus("offline");
+      }
+    }).catch(() => { if (!cancelled) { setScores([]); setSyncStatus(cloudSync ? "offline" : "local"); } });
+    return () => { cancelled = true; };
+  }, [refreshKey]);
+  const visibleScores: StoredScore[] = [demoStored, ...scores.filter((item) => item.id !== demoStored.id)];
+  return [visibleScores, syncStatus] as const;
+}
+
+async function persistScore(score: StoredScore): Promise<void> {
+  await library.save(score);
+  if (cloudSync) await cloudSync.save(score).catch(() => {});
 }
 
 function ScoreThumb({ compact = false }: { compact?: boolean }) {
@@ -229,7 +255,8 @@ function Upload({ onSaved }: { onSaved: () => void }) {
       setProgress(96); setProgressText("악보 구조 확인 중");
       const score = parseMusicXml(xml);
       const savedName = isPdf ? selected.name.replace(/\.pdf$/i, ".musicxml") : selected.name;
-      await library.save({ id: score.id, name: savedName, xml, score, savedAt: Date.now() });
+      const now = Date.now();
+      await persistScore({ id: score.id, name: savedName, xml, score, savedAt: now, updatedAt: now, note: "", annotations: [] });
       setPendingPdf(null); setProgress(100); setProgressText("준비 완료"); onSaved(); setTimeout(() => go("player", score.id), 250);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "악보를 열지 못했습니다."); setBusy(false); setProgress(0); setSetupProgress(null); setSetupMeta(""); }
   };
@@ -313,7 +340,7 @@ function Library({ scores, onImported }: { scores: StoredScore[]; onImported: ()
   const [sort, setSort] = useState("recent");
   const [message, setMessage] = useState("");
   const exportScores = () => {
-    const blob = new Blob([createScoreflowBundle(scores, (id) => localStorage.getItem(`scoreflow-note:${id}`) || "")], { type: "application/json" });
+    const blob = new Blob([createScoreflowBundle(scores)], { type: "application/json" });
     const anchor = document.createElement("a");
     anchor.href = URL.createObjectURL(blob); anchor.download = `scoreflow-band-${new Date().toISOString().slice(0, 10)}.scoreflow`; anchor.click();
     setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
@@ -325,8 +352,7 @@ function Library({ scores, onImported }: { scores: StoredScore[]; onImported: ()
       const shared = readScoreflowBundle(await file.text());
       for (const item of shared) {
         const score = parseMusicXml(item.xml);
-        await library.save({ id: score.id, name: item.name, xml: item.xml, score, savedAt: item.savedAt });
-        if (item.note) localStorage.setItem(`scoreflow-note:${score.id}`, item.note);
+        await persistScore({ id: score.id, name: item.name, xml: item.xml, score, savedAt: item.savedAt, updatedAt: Date.now(), note: item.note, annotations: item.annotations });
       }
       setMessage(`${shared.length}개의 악보와 메모를 가져왔습니다.`); onImported();
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : "공유 파일을 가져오지 못했습니다."); }
@@ -367,7 +393,7 @@ function Settings({ settings, setSettings }: { settings: SettingsState; setSetti
 
 function SettingRow({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) { return <div className="setting-row"><span><strong>{label}</strong>{hint && <small>{hint}</small>}</span>{children}</div>; }
 
-function ScoreCanvas({ xml, eventIndex, zoom, annotations }: { xml: string; eventIndex: number; zoom: number; annotations: boolean }) {
+function ScoreCanvas({ xml, eventIndex, zoom, annotationMode, lines, onLinesChange }: { xml: string; eventIndex: number; zoom: number; annotationMode: boolean; lines: string[]; onLinesChange: (lines: string[]) => void }) {
   const host = useRef<HTMLDivElement>(null); const osmd = useRef<OsmdInstance | null>(null); const last = useRef(0);
   useEffect(() => {
     if (!host.current) return;
@@ -387,20 +413,23 @@ function ScoreCanvas({ xml, eventIndex, zoom, annotations }: { xml: string; even
   }, [xml]);
   useEffect(() => { if (!osmd.current) return; osmd.current.Zoom = zoom / 100; osmd.current.render(); }, [zoom]);
   useEffect(() => { const cursor = osmd.current?.cursor; if (!cursor) return; if (eventIndex < last.current) cursor.reset(); const steps = eventIndex < last.current ? eventIndex : eventIndex - last.current; for (let i = 0; i < steps; i += 1) cursor.next(); cursor.show(); last.current = eventIndex; }, [eventIndex]);
-  return <div className="score-stage"><div className="score-render" ref={host}/>{annotations && <DrawingLayer/>}</div>;
+  return <div className="score-stage"><div className="score-render" ref={host}/>{annotationMode && <DrawingLayer lines={lines} onChange={onLinesChange}/>}</div>;
 }
 
-function DrawingLayer() {
-  const [lines, setLines] = useState<string[]>([]); const active = useRef<number | null>(null);
-  const point = (event: ReactPointerEvent<SVGSVGElement>) => { const rect = event.currentTarget.getBoundingClientRect(); return `${event.clientX - rect.left},${event.clientY - rect.top}`; };
-  return <svg className="drawing-layer" onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); active.current = lines.length; setLines([...lines, `M${point(e)}`]); }} onPointerMove={(e) => { if (active.current === null) return; setLines((current) => current.map((line, i) => i === active.current ? `${line} L${point(e)}` : line)); }} onPointerUp={() => { active.current = null; }}>{lines.map((line, i) => <path key={i} d={line}/>)}</svg>;
+function DrawingLayer({ lines, onChange }: { lines: string[]; onChange: (lines: string[]) => void }) {
+  const [draft, setDraft] = useState(lines); const latest = useRef(lines); const active = useRef<number | null>(null);
+  useEffect(() => { latest.current = lines; setDraft(lines); }, [lines]);
+  const update = (next: string[]) => { latest.current = next; setDraft(next); };
+  const point = (event: ReactPointerEvent<SVGSVGElement>) => { const rect = event.currentTarget.getBoundingClientRect(); return `${Math.round(((event.clientX - rect.left) / rect.width) * 1000)},${Math.round(((event.clientY - rect.top) / rect.height) * 1000)}`; };
+  const finish = () => { if (active.current === null) return; active.current = null; onChange(latest.current); };
+  return <svg className="drawing-layer" viewBox="0 0 1000 1000" preserveAspectRatio="none" onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); active.current = draft.length; update([...draft, `M${point(e)}`]); }} onPointerMove={(e) => { if (active.current === null) return; update(latest.current.map((line, i) => i === active.current ? `${line} L${point(e)}` : line)); }} onPointerUp={finish} onPointerCancel={finish}>{draft.map((line, i) => <path key={i} d={line} vectorEffect="non-scaling-stroke"/>)}</svg>;
 }
 
 function midiName(midi: number) { return `${["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"][midi % 12]}${Math.floor(midi / 12) - 1}`; }
 
-function Player({ item, settings }: { item: StoredScore; settings: SettingsState }) {
+function Player({ item, settings, onChanged }: { item: StoredScore; settings: SettingsState; onChanged: () => void }) {
   const engine = useMemo(() => { const value = new ScoreFlowEngine(item.score); value.autoTurnEnabled = settings.autoTurn; return value; }, [item, settings.autoTurn]);
-  const [tracking, setTracking] = useState<TrackingState>(engine.follower.state); const [source, setSource] = useState<"microphone" | "midi" | null>(null); const [level, setLevel] = useState(0); const [lastNote, setLastNote] = useState<number | null>(null); const [annotation, setAnnotation] = useState(false); const [noteOpen, setNoteOpen] = useState(false); const [note, setNote] = useState(() => localStorage.getItem(`scoreflow-note:${item.id}`) || ""); const [message, setMessage] = useState(""); const [previewing, setPreviewing] = useState(false); const [metronome, setMetronome] = useState(false); const [practiceTempo, setPracticeTempo] = useState(Math.round(item.score.initialTempo));
+  const [tracking, setTracking] = useState<TrackingState>(engine.follower.state); const [source, setSource] = useState<"microphone" | "midi" | null>(null); const [level, setLevel] = useState(0); const [lastNote, setLastNote] = useState<number | null>(null); const [annotation, setAnnotation] = useState(false); const [noteOpen, setNoteOpen] = useState(false); const [note, setNote] = useState(item.note ?? localStorage.getItem(`scoreflow-note:${item.id}`) ?? ""); const [lines, setLines] = useState(item.annotations ?? []); const [message, setMessage] = useState(""); const [previewing, setPreviewing] = useState(false); const [metronome, setMetronome] = useState(false); const [practiceTempo, setPracticeTempo] = useState(Math.round(item.score.initialTempo));
   const mic = useRef<MicrophonePitchSource | null>(null); const midi = useRef<MidiNoteSource | null>(null); const practice = useRef<PracticeAudio | null>(null);
   const accept = (observation: NoteObservation) => { setLastNote(observation.midi); setTracking(engine.accept(observation).tracking); };
   const stop = async () => { await mic.current?.stop(); midi.current?.stop(); mic.current = null; midi.current = null; setSource(null); setTracking(engine.follower.pause()); };
@@ -413,6 +442,11 @@ function Player({ item, settings }: { item: StoredScore; settings: SettingsState
   }, [engine, item.score]);
   useEffect(() => { practice.current?.setTempo(practiceTempo); }, [practiceTempo]);
   useEffect(() => () => { void mic.current?.stop(); midi.current?.stop(); }, []);
+  useEffect(() => { setNote(item.note ?? ""); setLines(item.annotations ?? []); }, [item.id]);
+  const saveEdits = (nextNote: string, nextLines: string[]) => {
+    const next = { ...item, note: nextNote, annotations: nextLines, updatedAt: Date.now() };
+    void persistScore(next).then(onChanged);
+  };
   const togglePreview = async () => {
     if (previewing) { practice.current?.pause(); setPreviewing(false); return; }
     await stop();
@@ -428,17 +462,17 @@ function Player({ item, settings }: { item: StoredScore; settings: SettingsState
   return <div className={`player ${settings.highContrast ? "high-contrast" : ""}`}>
     <header className="player-header"><button className="brand compact" onClick={() => go("home")}><span className="brand-mark"><Icon name="music" size={17}/></span></button><div className="player-title"><strong>{item.score.title}</strong><span>{item.score.composer || "작곡가 미상"}</span></div><div className="player-page">{tracking.page} / {item.score.pageCount}</div><button className={`tool-button ${annotation ? "active" : ""}`} onClick={() => setAnnotation(!annotation)}><Icon name="pen"/>필기</button><button className={`tool-button ${noteOpen ? "active" : ""}`} onClick={() => setNoteOpen(!noteOpen)}><Icon name="library"/>메모</button><button className="tool-button" onClick={() => go("settings")}><Icon name="settings"/>설정</button></header>
     <div className="player-body"><aside className="player-sidebar"><div className="connection"><span><i className={source || previewing ? "live" : ""}/>{previewing ? "미리듣기 재생 중" : source === "midi" ? "MIDI 연결됨" : source === "microphone" ? "마이크 연결됨" : "입력 대기"}</span><strong>{settings.instrument} 모드</strong></div><h3>입력 장치</h3><button className={source === "microphone" ? "selected" : ""} onClick={() => void startMic()}><Icon name="mic"/>내장 마이크</button><button className={source === "midi" ? "selected" : ""} onClick={() => void startMidi()}><Icon name="music"/>Web MIDI</button><div className="sensitivity"><span>입력 레벨</span><i><b style={{ width: `${Math.min(100, level * 500)}%` }}/></i></div><h3>연습 도구</h3><button className={previewing ? "selected" : ""} onClick={() => void togglePreview()}><Icon name={previewing ? "pause" : "speaker"}/>{previewing ? "미리듣기 정지" : "악보 미리듣기"}</button><button className={metronome ? "selected" : ""} onClick={() => void toggleMetronome()}><Icon name="metronome"/>메트로놈 {metronome ? "켜짐" : "켜기"}</button><label className="tempo-control"><span>연습 템포</span><strong>{practiceTempo} BPM</strong><input type="range" min="40" max="220" value={practiceTempo} onChange={(e) => setPracticeTempo(Number(e.target.value))}/></label><div className="tracking-card"><span className="pulse"><i/></span><div><strong>{previewing ? "악보를 재생하는 중" : source ? "연주를 따라가는 중" : "입력을 연결하세요"}</strong><small>{measure}마디 · {tracking.page < item.score.pageCount ? "다음 페이지 준비됨" : "마지막 페이지"}</small></div></div><div className="metrics"><div><span>템포</span><strong>{previewing || metronome ? practiceTempo : Math.round(tracking.estimatedTempo)} <small>BPM</small></strong></div><div><span>입력 음</span><strong>{lastNote === null ? "—" : midiName(lastNote)}</strong></div><div><span>인식 신뢰도</span><strong>{Math.round(tracking.confidence * 100)}%</strong></div></div>{message && <div className="notice error small">{message}</div>}</aside>
-      <main className="player-main"><div className="score-meta"><span>{previewing ? "미리듣기 재생 중" : source ? "연주를 따라가는 중" : "대기 중"}</span><strong>{measure} / {item.score.measures.length}마디</strong></div><ScoreCanvas xml={item.xml} eventIndex={tracking.eventIndex} zoom={settings.zoom} annotations={annotation}/></main>
+      <main className="player-main"><div className="score-meta"><span>{previewing ? "미리듣기 재생 중" : source ? "연주를 따라가는 중" : "대기 중"}</span><strong>{measure} / {item.score.measures.length}마디</strong></div><ScoreCanvas xml={item.xml} eventIndex={tracking.eventIndex} zoom={settings.zoom} annotationMode={annotation} lines={lines} onLinesChange={(next) => { setLines(next); saveEdits(note, next); }}/></main>
     </div>
-    {noteOpen && <aside className="note-drawer"><div><strong>합주 메모</strong><button onClick={() => setNoteOpen(false)}>×</button></div><textarea value={note} onChange={(e) => { setNote(e.target.value); localStorage.setItem(`scoreflow-note:${item.id}`, e.target.value); }} placeholder="큐, 다이내믹, 파트별 주의점을 적어 두세요."/><small>이 기기에 자동 저장됩니다.</small></aside>}
+    {noteOpen && <aside className="note-drawer"><div><strong>합주 메모</strong><button onClick={() => setNoteOpen(false)}>×</button></div><textarea value={note} onChange={(e) => setNote(e.target.value)} onBlur={() => saveEdits(note, lines)} placeholder="큐, 다이내믹, 파트별 주의점을 적어 두세요."/><small>{cloudSync ? "이 기기와 밴드 클라우드에 저장됩니다." : "이 기기에 자동 저장됩니다."}</small></aside>}
     <footer className={`player-footer ${settings.largeControls ? "large" : ""}`}><div className="progress"><b style={{ width: `${progress}%` }}/></div><button onClick={() => { const next = engine.goToMeasure(Math.max(0, tracking.measureIndex - 1)); setTracking(next); }}>←</button><button className="pause-main" onClick={() => source ? void stop() : void startMic()}><Icon name={source ? "pause" : "play"}/></button><button onClick={() => { const next = engine.goToMeasure(Math.min(item.score.measures.length - 1, tracking.measureIndex + 1)); setTracking(next); }}>→</button><span>{settings.autoTurn ? "자동 넘김" : "수동 넘김"}</span></footer>
   </div>;
 }
 
 export function App() {
-  const [view, setView] = useState<View>(currentRoute()); const [refresh, setRefresh] = useState(0); const scores = useScores(refresh); const [settings, setSettings] = useSettings();
+  const [view, setView] = useState<View>(currentRoute()); const [refresh, setRefresh] = useState(0); const [scores, syncStatus] = useScores(refresh); const [settings, setSettings] = useSettings();
   useEffect(() => { const onHash = () => setView(currentRoute()); addEventListener("hashchange", onHash); if (!location.hash) go("home"); return () => removeEventListener("hashchange", onHash); }, []);
   const id = new URLSearchParams(location.hash.split("?")[1] || "").get("id"); const selected = scores.find((item) => item.id === id) ?? scores[0]!;
-  if (view === "player") return <Player item={selected} settings={settings}/>;
-  return <div className="app"><Header view={view}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores} onImported={() => setRefresh((v) => v + 1)}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
+  if (view === "player") return <Player item={selected} settings={settings} onChanged={() => setRefresh((v) => v + 1)}/>;
+  return <div className="app"><Header view={view} syncStatus={syncStatus}/>{view === "home" && <Home scores={scores}/>} {view === "upload" && <Upload onSaved={() => setRefresh((v) => v + 1)}/>} {view === "library" && <Library scores={scores} onImported={() => setRefresh((v) => v + 1)}/>} {view === "settings" && <Settings settings={settings} setSettings={setSettings}/>}</div>;
 }

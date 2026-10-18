@@ -1,0 +1,17 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "bands": {
+      "$bandKey": {
+        ".read": "auth != null && $bandKey.matches(/^sf-[A-Za-z0-9_-]{8,64}$/)",
+        ".write": "auth != null && $bandKey.matches(/^sf-[A-Za-z0-9_-]{8,64}$/)",
+        "scores": {
+          "$scoreId": {
+            ".validate": "newData.hasChildren(['id', 'name', 'xml', 'savedAt', 'updatedAt', 'note']) && newData.child('id').val() === $scoreId && $scoreId.matches(/^[A-Za-z0-9_-]{1,160}$/) && newData.child('name').isString() && newData.child('name').val().length <= 300 && newData.child('xml').isString() && newData.child('xml').val().length <= 8000000 && newData.child('savedAt').isNumber() && newData.child('updatedAt').isNumber() && newData.child('note').isString() && newData.child('note').val().length <= 100000"
+          }
+        }
+      }
+    }
+  }
+}

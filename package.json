@@ -24,6 +24,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "firebase": "^13.0.0",
     "jszip": "^3.10.2",
     "opensheetmusicdisplay": "^2.2.1",
     "react": "^19.3.0",

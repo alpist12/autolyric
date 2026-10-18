@@ -53,4 +53,7 @@ export interface StoredScore {
   xml: string;
   score: Score;
   savedAt: number;
+  updatedAt?: number;
+  note?: string;
+  annotations?: string[];
 }
