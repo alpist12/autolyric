@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
-import { ensurePdfjsPolyfills, formatLocalOmrError, localOmrUnsupportedMessage, mergeMusicXmlPages } from "./localOmr";
+import { ensurePdfjsPolyfills, formatLocalOmrError, localOmrUnsupportedMessage, mapOmrSetupToOverallProgress, mergeMusicXmlPages } from "./localOmr";
 
 Object.assign(globalThis, { DOMParser, XMLSerializer });
 
@@ -60,5 +60,13 @@ describe("ensurePdfjsPolyfills", () => {
     } finally {
       if (original) proto.toHex = original;
     }
+  });
+});
+
+describe("mapOmrSetupToOverallProgress", () => {
+  it("keeps the visible overall percentage moving during engine setup", () => {
+    expect(mapOmrSetupToOverallProgress(0)).toBe(14);
+    expect(mapOmrSetupToOverallProgress(50)).toBe(35);
+    expect(mapOmrSetupToOverallProgress(100)).toBe(55);
   });
 });

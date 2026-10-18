@@ -18,6 +18,8 @@ const MODELS_TOTAL_BYTES = 157482318;
 // The decoder runs hundreds of tiny steps per staff, where WebGPU's per-call
 // overhead loses to WASM; the big convolutional models gain from the GPU.
 const GPU_MODELS = new Set([MODELS[0], MODELS[1]]);
+const isAppleMobile = /iPad|iPhone|iPod/i.test(navigator.userAgent)
+  || (/Macintosh/i.test(navigator.userAgent) && /Mobile/i.test(navigator.userAgent));
 
 let ort;
 
@@ -160,10 +162,20 @@ async function newSession(id) {
   const gpu = useGpu && GPU_MODELS.has(name);
   const eps = gpu ? ["webgpu", "wasm"] : ["wasm"];
   const t0 = performance.now();
-  const session = await ort.InferenceSession.create(await modelBytes(name), {
-    executionProviders: eps,
-    graphOptimizationLevel: "all",
-  });
+  const started = performance.now();
+  const heartbeat = setInterval(() => post({
+    type: "progress", stage: "infer", step: "session", model: name.split("_")[0],
+    index: id + 1, total: MODELS.length, elapsed: Math.round((performance.now() - started) / 1000),
+  }), 2000);
+  let session;
+  try {
+    session = await ort.InferenceSession.create(await modelBytes(name), {
+      executionProviders: eps,
+      graphOptimizationLevel: isAppleMobile ? "basic" : "all",
+    });
+  } finally {
+    clearInterval(heartbeat);
+  }
   if (gpu) onGpu.add(id);
   else onGpu.delete(id);
   post({ type: "log", msg: `Loaded ${name} on ${eps[0]} in ${Math.round(performance.now() - t0)} ms` });
@@ -327,7 +339,8 @@ async function init() {
   })();
 
   const pythonTask = (async () => {
-    ort = await import(ORT_URL + "ort.webgpu.min.mjs");
+    // ONNX Runtime's JSEP/WebGPU bundle has severe memory overhead on iOS.
+    ort = await import(ORT_URL + (isAppleMobile ? "ort.min.mjs" : "ort.webgpu.min.mjs"));
     ort.env.wasm.wasmPaths = ORT_URL;
     ort.env.wasm.numThreads = self.crossOriginIsolated
       ? Math.min(4, navigator.hardwareConcurrency || 1)
@@ -337,7 +350,7 @@ async function init() {
     const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
     post({ type: "progress", stage: "setup", percent: 12, detail: "기기 그래픽 가속(WebGPU) 지원 확인 중" });
     try {
-      useGpu = !!(
+      useGpu = !isAppleMobile && !!(
         self.navigator.gpu &&
         (await Promise.race([
           navigator.gpu.requestAdapter(),

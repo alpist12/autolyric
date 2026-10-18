@@ -21,6 +21,10 @@ export function localOmrUnsupportedMessage(userAgent = typeof navigator === "und
   return "이 브라우저는 기기 내 무료 변환(WebAssembly JSPI)을 지원하지 않습니다. 최신 Chrome·Edge 또는 Safari 27 이상에서 다시 시도해 주세요.";
 }
 
+export function mapOmrSetupToOverallProgress(setupPercent: number): number {
+  return 14 + Math.round(Math.min(100, Math.max(0, setupPercent)) * 0.41);
+}
+
 export function ensurePdfjsPolyfills(): void {
   const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
   if (typeof proto.toHex !== "function") {
@@ -68,6 +72,7 @@ type WorkerMessage =
       calls?: number;
       staff?: number;
       tokens?: number;
+      elapsed?: number;
     }
   | { type: "loaded" }
   | { type: "ready" }
@@ -301,6 +306,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     if (percent !== undefined) currentPercent = Math.max(currentPercent, Math.min(99, Math.round(percent)));
     if (message) currentMessage = message;
     setupPercent = Math.max(setupPercent, Math.min(99, Math.round(pyStagePercent + dlStagePercent)));
+    if (!engineReady) currentPercent = Math.max(currentPercent, mapOmrSetupToOverallProgress(setupPercent));
     if (nextSetupText) setupText = nextSetupText;
     updateMeta();
     onProgress(currentPercent, currentMessage, engineReady ? undefined : { setupPercent, setupText, setupMeta });
@@ -312,7 +318,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     } else if (data.type === "ready") {
       engineReady = true;
       setupPercent = 100;
-      emitProgress(15, "악보 분석 시작 중");
+      emitProgress(55, "악보 분석 시작 중");
       readyResolve();
     } else if (data.type === "progress" && data.stage === "setup") {
       pyStagePercent = Math.max(pyStagePercent, Math.min(48, data.percent ?? pyStagePercent));
@@ -336,12 +342,13 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
       const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
       emitProgress(undefined, undefined, st);
     } else if (data.type === "progress" && data.stage === "infer") {
-      const pageSpan = 79 / Math.max(1, totalPages);
-      const pageBase = 15 + pageIndex * pageSpan;
+      const pageSpan = 39 / Math.max(1, totalPages);
+      const pageBase = 55 + pageIndex * pageSpan;
       const prefix = `악보 ${pageIndex + 1}/${totalPages}쪽`;
       if (data.step === "session") {
         const sub = ((data.index ?? 1) / Math.max(1, data.total ?? 3)) * 0.15;
-        emitProgress(pageBase + pageSpan * sub, `${prefix} · 신경망 모델 메모리에 올리는 중 (${data.index ?? 1}/${data.total ?? 3})`);
+        const elapsed = data.elapsed ? ` · ${data.elapsed}초 경과` : "";
+        emitProgress(pageBase + pageSpan * sub, `${prefix} · 신경망 모델 준비 중 (${data.index ?? 1}/${data.total ?? 3})${elapsed}${data.elapsed && data.elapsed >= 20 ? " · iPhone에서는 수 분 걸릴 수 있어요" : ""}`);
       } else if (data.step === "run") {
         if (data.model === "segnet") {
           const sub = 0.15 + Math.min(0.25, (data.calls ?? 1) * 0.06);
@@ -384,7 +391,7 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   // Gentle ticker during score analysis
   const ticker = setInterval(() => {
     if (engineReady) {
-      const pageCeiling = Math.min(93, 15 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 79));
+      const pageCeiling = Math.min(93, 55 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 39));
       if (currentPercent < pageCeiling) {
         emitProgress(currentPercent + 1);
       }
@@ -408,10 +415,10 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     const pages: string[] = [];
     for (let index = 0; index < images.length; index += 1) {
       pageIndex = index;
-      const pageStart = 15 + Math.round((index / totalPages) * 79);
+      const pageStart = 55 + Math.round((index / totalPages) * 39);
       emitProgress(pageStart, `악보 ${index + 1}/${images.length}쪽 분석 시작`);
       pages.push(await recognise(images[index]!));
-      const pageDone = 15 + Math.round(((index + 1) / totalPages) * 79);
+      const pageDone = 55 + Math.round(((index + 1) / totalPages) * 39);
       emitProgress(pageDone, `악보 ${index + 1}/${images.length}쪽 인식 완료`);
     }
     emitProgress(95, "페이지를 하나의 MusicXML로 합치는 중");
