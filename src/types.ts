@@ -50,6 +50,7 @@ export interface TrackingState {
 export interface StoredScore {
   id: string;
   name: string;
+  displayName?: string;
   xml: string;
   score: Score;
   savedAt: number;

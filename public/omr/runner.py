@@ -519,6 +519,17 @@ def recognise(image_path, systems_json=""):
         return f.read()
 
 
+async def recognise_async(image_path, systems_json=""):
+    """JSPI entrypoint.
+
+    Entering through an async Python function creates the suspending stack
+    directly. This avoids Safari's restriction on JavaScript frames between
+    WebAssembly.promising and WebAssembly.Suspending while keeping HOMR's
+    synchronous call graph intact.
+    """
+    return recognise(image_path, systems_json)
+
+
 def recognise_profiled(image_path, systems_json=""):
     """recognise(), printing where the Python's time goes (tests/omr-bench.html)."""
     import cProfile
@@ -535,3 +546,7 @@ def recognise_profiled(image_path, systems_json=""):
     stats.sort_stats("cumtime").print_stats(35)
     print(s.getvalue())
     return out
+
+
+async def recognise_profiled_async(image_path, systems_json=""):
+    return recognise_profiled(image_path, systems_json)

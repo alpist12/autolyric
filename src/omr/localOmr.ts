@@ -9,6 +9,18 @@ export type OmrProgressDetails = {
 
 export type OmrProgress = (percent: number, message: string, details?: OmrProgressDetails) => void;
 
+export function supportsLocalOmrEngine(): boolean {
+  return typeof WebAssembly !== "undefined" && typeof (WebAssembly as typeof WebAssembly & { Suspending?: unknown }).Suspending === "function";
+}
+
+export function localOmrUnsupportedMessage(userAgent = typeof navigator === "undefined" ? "" : navigator.userAgent): string {
+  const isAppleTablet = /iPad/i.test(userAgent) || (/Macintosh/i.test(userAgent) && /Mobile/i.test(userAgent));
+  if (isAppleTablet) {
+    return "이 iPad의 브라우저 엔진은 기기 내 무료 변환을 지원하지 않습니다. Chrome으로 바꿔도 동일합니다. iPadOS 27 이상으로 업데이트한 뒤 다시 시도하거나, PC의 최신 Chrome 또는 Edge에서 변환해 주세요. PDF 원본 미리보기는 그대로 사용할 수 있습니다.";
+  }
+  return "이 브라우저는 기기 내 무료 변환(WebAssembly JSPI)을 지원하지 않습니다. 최신 Chrome·Edge 또는 Safari 27 이상에서 다시 시도해 주세요.";
+}
+
 export function ensurePdfjsPolyfills(): void {
   const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
   if (typeof proto.toHex !== "function") {
@@ -26,13 +38,16 @@ export function ensurePdfjsPolyfills(): void {
   }
 }
 
-export function formatLocalOmrError(reason: unknown): Error {
+export function formatLocalOmrError(reason: unknown, userAgent?: string): Error {
   const message = reason instanceof Error ? reason.message : String(reason);
   if (/invalid (?:root reference|pdf structure)/i.test(message)) {
     return new Error("PDF 내부 구조가 손상되었거나 표준 형식이 아닙니다. 브라우저에서 인쇄 → PDF로 저장한 새 파일을 다시 선택해 주세요.");
   }
   if (/WebAssembly JSPI/i.test(message)) {
-    return new Error("이 브라우저 버전은 기기 내 무료 변환(WebAssembly JSPI)을 지원하지 않습니다. 태블릿의 Chrome 앱(최신 버전)으로 열어 주세요.");
+    return new Error(localOmrUnsupportedMessage(userAgent));
+  }
+  if (/JavaScript frames found between WebAssembly\.Suspending and WebAssembly\.promising/i.test(message)) {
+    return new Error("iPad 브라우저의 변환 엔진 연결이 중단되었습니다. 페이지를 완전히 새로고침한 뒤 다시 시도해 주세요. 같은 오류가 반복되면 사이트가 최신 버전인지 확인해 주세요.");
   }
   return reason instanceof Error ? reason : new Error(message);
 }
@@ -181,7 +196,7 @@ type WarmupState = {
 let warmupState: WarmupState | null = null;
 
 export function warmupLocalOmrEngine(): void {
-  if (typeof Worker === "undefined" || typeof caches === "undefined" || warmupState) return;
+  if (typeof Worker === "undefined" || typeof caches === "undefined" || !supportsLocalOmrEngine() || warmupState) return;
   try {
     const worker = new Worker(new URL("omr-loader.js", document.baseURI), { type: "module" });
     const state: WarmupState = {
@@ -228,6 +243,7 @@ export function warmupLocalOmrEngine(): void {
 export async function convertPdfLocally(file: File, onProgress: OmrProgress): Promise<string> {
   if (file.size > MAX_PDF_BYTES) throw new Error("기기 내 변환 안정성을 위해 PDF는 20MB 이하만 지원합니다.");
   if (typeof Worker === "undefined" || typeof caches === "undefined") throw new Error("이 브라우저는 기기 내 악보 변환을 지원하지 않습니다.");
+  if (!supportsLocalOmrEngine()) throw new Error(localOmrUnsupportedMessage());
 
   const adopted = warmupState && !warmupState.error ? warmupState : null;
   if (warmupState && warmupState !== adopted) {

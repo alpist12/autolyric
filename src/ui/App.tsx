@@ -3,7 +3,7 @@ import { MicrophonePitchSource } from "../audio/MicrophonePitchSource";
 import { PracticeAudio } from "../audio/PracticeAudio";
 import { MidiNoteSource } from "../input/MidiNoteSource";
 import { parseMusicXml } from "../musicxml/parseMusicXml";
-import { convertPdfLocally, formatLocalOmrError, getPdfPageCount, renderPdfPageToCanvas, warmupLocalOmrEngine } from "../omr/localOmr";
+import { convertPdfLocally, formatLocalOmrError, getPdfPageCount, localOmrUnsupportedMessage, renderPdfPageToCanvas, supportsLocalOmrEngine, warmupLocalOmrEngine } from "../omr/localOmr";
 import { retainSelectedFile } from "./retainSelectedFile";
 import { ScoreFlowEngine } from "../ScoreFlowEngine";
 import { createScoreflowBundle, readScoreflowBundle } from "../share/scoreflowBundle";
@@ -96,6 +96,10 @@ async function persistScore(score: StoredScore): Promise<void> {
   if (cloudSync) await cloudSync.save(score).catch(() => {});
 }
 
+function scoreTitle(item: StoredScore): string {
+  return item.displayName?.trim() || item.score.title;
+}
+
 function ScoreThumb({ compact = false }: { compact?: boolean }) {
   return <div className={`score-thumb ${compact ? "compact" : ""}`} aria-hidden="true">
     <span>Adagio sostenuto</span><svg viewBox="0 0 600 120" preserveAspectRatio="xMidYMid meet">
@@ -112,7 +116,7 @@ function Home({ scores }: { scores: StoredScore[] }) {
     <section className="home-grid">
       <button className="continue-card" onClick={() => go("player", scores[0]!.id)}>
         <div className="continue-preview"><ScoreThumb/><span className="tag">이어서 연주</span></div>
-        <div className="continue-body"><div><strong>{scores[0]!.score.title}</strong><span>{scores[0]!.score.composer || "작곡가 미상"} · 2마디에서 멈춤 · 1페이지</span><i><b/></i></div><span className="play-round"><Icon name="play" size={25}/></span></div>
+        <div className="continue-body"><div><strong>{scoreTitle(scores[0]!)}</strong><span>{scores[0]!.score.composer || "작곡가 미상"} · 2마디에서 멈춤 · 1페이지</span><i><b/></i></div><span className="play-round"><Icon name="play" size={25}/></span></div>
       </button>
       <div className="quick-grid">
         <button className="quick-card accent" onClick={() => go("upload")}><span className="quick-icon"><Icon name="upload"/></span><span><strong>악보 업로드</strong><small>PDF · MusicXML · MXL</small></span></button>
@@ -127,8 +131,8 @@ function Home({ scores }: { scores: StoredScore[] }) {
 }
 
 function ScoreCard({ item, table = false }: { item: StoredScore; table?: boolean }) {
-  if (table) return <button className="score-row" onClick={() => go("player", item.id)}><ScoreThumb compact/><span className="row-title"><strong>{item.score.title}</strong><small>{item.score.composer || "작곡가 미상"}</small></span><span>MusicXML</span><span>{item.score.pageCount}쪽</span><span>{new Date(item.savedAt).toLocaleDateString("ko-KR")}</span><Icon name="chevron" size={18}/></button>;
-  return <button className="score-card" onClick={() => go("player", item.id)}><div className="card-preview"><ScoreThumb compact/></div><span><strong>{item.score.title}</strong><small>{item.score.composer || "작곡가 미상"}</small><em>{item.id === demoStored.id ? "어제 연주" : "최근 추가"} · MusicXML</em></span></button>;
+  if (table) return <button className="score-row" onClick={() => go("player", item.id)}><ScoreThumb compact/><span className="row-title"><strong>{scoreTitle(item)}</strong><small>{item.score.composer || "작곡가 미상"}</small></span><span>MusicXML</span><span>{item.score.pageCount}쪽</span><span>{new Date(item.savedAt).toLocaleDateString("ko-KR")}</span><Icon name="chevron" size={18}/></button>;
+  return <button className="score-card" onClick={() => go("player", item.id)}><div className="card-preview"><ScoreThumb compact/></div><span><strong>{scoreTitle(item)}</strong><small>{item.score.composer || "작곡가 미상"}</small><em>{item.id === demoStored.id ? "어제 연주" : "최근 추가"} · MusicXML</em></span></button>;
 }
 
 async function readScoreFile(file: File): Promise<string> {
@@ -203,6 +207,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
   const [pendingPdf, setPendingPdf] = useState<File | null>(null);
   const [pdfPage, setPdfPage] = useState(1);
   const [pdfPageCount, setPdfPageCount] = useState(1);
+  const canConvertPdf = supportsLocalOmrEngine();
 
   const handle = async (file?: File, confirmed = false) => {
     if (!file) return;
@@ -293,7 +298,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
               <p>왼쪽 화면에서 원본 PDF 악보를 넘기며 바로 보실 수 있습니다. 마이크 자동 페이지 넘김 기능을 쓰려면 아래 버튼을 눌러 변환을 시작하세요.</p>
             </div>
             {!busy ? (
-              <button type="button" className="primary convert-start-btn" onClick={() => void handle(pendingPdf, true)}>
+              <button type="button" className="primary convert-start-btn" disabled={!canConvertPdf} onClick={() => void handle(pendingPdf, true)}>
                 파일 변환하기
               </button>
             ) : (
@@ -321,6 +326,7 @@ function Upload({ onSaved }: { onSaved: () => void }) {
                 )}
               </div>
             )}
+            {!canConvertPdf && <div className="notice error omr-support-notice" role="status">{localOmrUnsupportedMessage()}</div>}
             <small className="convert-meta-note">
               첫 변환 시 약 157MB 인식 모델을 기기에 캐시합니다 · <a href="https://github.com/pzfreo/partsong" target="_blank" rel="noreferrer">오픈소스 AGPL-3.0</a> · <a href="source/autolyric-scoreflow-0.1.0.tgz">ScoreFlow 소스</a>
             </small>
@@ -352,12 +358,12 @@ function Library({ scores, onImported }: { scores: StoredScore[]; onImported: ()
       const shared = readScoreflowBundle(await file.text());
       for (const item of shared) {
         const score = parseMusicXml(item.xml);
-        await persistScore({ id: score.id, name: item.name, xml: item.xml, score, savedAt: item.savedAt, updatedAt: Date.now(), note: item.note, annotations: item.annotations });
+        await persistScore({ id: score.id, name: item.name, ...(item.displayName ? { displayName: item.displayName } : {}), xml: item.xml, score, savedAt: item.savedAt, updatedAt: Date.now(), note: item.note, annotations: item.annotations });
       }
       setMessage(`${shared.length}개의 악보와 메모를 가져왔습니다.`); onImported();
     } catch (reason) { setMessage(reason instanceof Error ? reason.message : "공유 파일을 가져오지 못했습니다."); }
   };
-  const filtered = scores.filter((item) => `${item.score.title} ${item.score.composer}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => sort === "title" ? a.score.title.localeCompare(b.score.title, "ko") : b.savedAt - a.savedAt);
+  const filtered = scores.filter((item) => `${scoreTitle(item)} ${item.score.composer}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => sort === "title" ? scoreTitle(a).localeCompare(scoreTitle(b), "ko") : b.savedAt - a.savedAt);
   return <main className="page library-page">
     <div className="library-heading"><div className="page-heading"><h1>내 악보</h1><p>{scores.length}개의 악보 · 이 기기에 저장됨</p></div><div className="library-actions"><button className="secondary" disabled={!scores.length} onClick={exportScores}>공유 파일 내보내기</button><button className="secondary" onClick={() => shareInput.current?.click()}>공유 파일 가져오기</button><input ref={shareInput} hidden type="file" accept=".scoreflow,application/json" onChange={(event) => { void importScores(event.target.files?.[0]); event.target.value = ""; }}/><button className="primary" onClick={() => go("upload")}><Icon name="plus"/>업로드</button></div></div>
     {message && <div className="notice share-notice" role="status">{message}</div>}
@@ -447,6 +453,17 @@ function Player({ item, settings, onChanged }: { item: StoredScore; settings: Se
     const next = { ...item, note: nextNote, annotations: nextLines, updatedAt: Date.now() };
     void persistScore(next).then(onChanged);
   };
+  const renameScore = () => {
+    const value = window.prompt("악보 제목을 입력하세요.", scoreTitle(item));
+    if (value === null) return;
+    const displayName = value.trim();
+    if (!displayName) { setMessage("악보 제목은 비워 둘 수 없습니다."); return; }
+    if (displayName.length > 120) { setMessage("악보 제목은 120자 이하로 입력해 주세요."); return; }
+    setMessage("제목을 저장하는 중…");
+    void persistScore({ ...item, displayName, updatedAt: Date.now() })
+      .then(() => { setMessage("제목을 변경했습니다."); onChanged(); })
+      .catch(() => setMessage("제목을 저장하지 못했습니다. 네트워크 연결을 확인해 주세요."));
+  };
   const togglePreview = async () => {
     if (previewing) { practice.current?.pause(); setPreviewing(false); return; }
     await stop();
@@ -460,7 +477,7 @@ function Player({ item, settings, onChanged }: { item: StoredScore; settings: Se
   };
   const measure = tracking.measureIndex + 1; const progress = Math.min(100, ((tracking.eventIndex + 1) / Math.max(1, item.score.events.length)) * 100);
   return <div className={`player ${settings.highContrast ? "high-contrast" : ""}`}>
-    <header className="player-header"><button className="brand compact" onClick={() => go("home")}><span className="brand-mark"><Icon name="music" size={17}/></span></button><div className="player-title"><strong>{item.score.title}</strong><span>{item.score.composer || "작곡가 미상"}</span></div><div className="player-page">{tracking.page} / {item.score.pageCount}</div><button className={`tool-button ${annotation ? "active" : ""}`} onClick={() => setAnnotation(!annotation)}><Icon name="pen"/>필기</button><button className={`tool-button ${noteOpen ? "active" : ""}`} onClick={() => setNoteOpen(!noteOpen)}><Icon name="library"/>메모</button><button className="tool-button" onClick={() => go("settings")}><Icon name="settings"/>설정</button></header>
+    <header className="player-header"><button className="brand compact" onClick={() => go("home")}><span className="brand-mark"><Icon name="music" size={17}/></span></button><button className="player-title rename-title" onClick={renameScore} aria-label="악보 제목 변경" title="눌러서 제목 변경"><strong>{scoreTitle(item)} <span aria-hidden="true">✎</span></strong><span>{item.score.composer || "작곡가 미상"}</span></button><div className="player-page">{tracking.page} / {item.score.pageCount}</div><button className={`tool-button ${annotation ? "active" : ""}`} onClick={() => setAnnotation(!annotation)}><Icon name="pen"/>필기</button><button className={`tool-button ${noteOpen ? "active" : ""}`} onClick={() => setNoteOpen(!noteOpen)}><Icon name="library"/>메모</button><button className="tool-button" onClick={() => go("settings")}><Icon name="settings"/>설정</button></header>
     <div className="player-body"><aside className="player-sidebar"><div className="connection"><span><i className={source || previewing ? "live" : ""}/>{previewing ? "미리듣기 재생 중" : source === "midi" ? "MIDI 연결됨" : source === "microphone" ? "마이크 연결됨" : "입력 대기"}</span><strong>{settings.instrument} 모드</strong></div><h3>입력 장치</h3><button className={source === "microphone" ? "selected" : ""} onClick={() => void startMic()}><Icon name="mic"/>내장 마이크</button><button className={source === "midi" ? "selected" : ""} onClick={() => void startMidi()}><Icon name="music"/>Web MIDI</button><div className="sensitivity"><span>입력 레벨</span><i><b style={{ width: `${Math.min(100, level * 500)}%` }}/></i></div><h3>연습 도구</h3><button className={previewing ? "selected" : ""} onClick={() => void togglePreview()}><Icon name={previewing ? "pause" : "speaker"}/>{previewing ? "미리듣기 정지" : "악보 미리듣기"}</button><button className={metronome ? "selected" : ""} onClick={() => void toggleMetronome()}><Icon name="metronome"/>메트로놈 {metronome ? "켜짐" : "켜기"}</button><label className="tempo-control"><span>연습 템포</span><strong>{practiceTempo} BPM</strong><input type="range" min="40" max="220" value={practiceTempo} onChange={(e) => setPracticeTempo(Number(e.target.value))}/></label><div className="tracking-card"><span className="pulse"><i/></span><div><strong>{previewing ? "악보를 재생하는 중" : source ? "연주를 따라가는 중" : "입력을 연결하세요"}</strong><small>{measure}마디 · {tracking.page < item.score.pageCount ? "다음 페이지 준비됨" : "마지막 페이지"}</small></div></div><div className="metrics"><div><span>템포</span><strong>{previewing || metronome ? practiceTempo : Math.round(tracking.estimatedTempo)} <small>BPM</small></strong></div><div><span>입력 음</span><strong>{lastNote === null ? "—" : midiName(lastNote)}</strong></div><div><span>인식 신뢰도</span><strong>{Math.round(tracking.confidence * 100)}%</strong></div></div>{message && <div className="notice error small">{message}</div>}</aside>
       <main className="player-main"><div className="score-meta"><span>{previewing ? "미리듣기 재생 중" : source ? "연주를 따라가는 중" : "대기 중"}</span><strong>{measure} / {item.score.measures.length}마디</strong></div><ScoreCanvas xml={item.xml} eventIndex={tracking.eventIndex} zoom={settings.zoom} annotationMode={annotation} lines={lines} onLinesChange={(next) => { setLines(next); saveEdits(note, next); }}/></main>
     </div>

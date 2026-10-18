@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
-import { ensurePdfjsPolyfills, formatLocalOmrError, mergeMusicXmlPages } from "./localOmr";
+import { ensurePdfjsPolyfills, formatLocalOmrError, localOmrUnsupportedMessage, mergeMusicXmlPages } from "./localOmr";
 
 Object.assign(globalThis, { DOMParser, XMLSerializer });
 
@@ -27,6 +27,25 @@ describe("formatLocalOmrError", () => {
   it("turns a broken PDF root error into a useful recovery instruction", () => {
     expect(formatLocalOmrError(new Error("Invalid root reference")).message).toContain("인쇄 → PDF로 저장");
     expect(formatLocalOmrError(new Error("Invalid PDF structure.")).message).toContain("인쇄 → PDF로 저장");
+  });
+
+  it("does not incorrectly tell iPad users to switch to Chrome", () => {
+    const userAgent = "Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1";
+    const message = formatLocalOmrError(new Error("This browser lacks WebAssembly JSPI."), userAgent).message;
+    expect(message).toContain("Chrome으로 바꿔도 동일");
+    expect(message).toContain("iPadOS 27 이상");
+  });
+
+  it("recognises desktop-mode iPads", () => {
+    const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/26.0 Mobile/15E148 Safari/604.1";
+    expect(localOmrUnsupportedMessage(userAgent)).toContain("이 iPad");
+  });
+
+  it("turns Safari's JSPI stack error into a recovery instruction", () => {
+    const message = formatLocalOmrError(new Error(
+      "JavaScript frames found between WebAssembly.Suspending and WebAssembly.promising (evaluating 'promisingFunc(null,...args)')",
+    )).message;
+    expect(message).toContain("페이지를 완전히 새로고침");
   });
 });
 

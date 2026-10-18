@@ -379,8 +379,12 @@ async function init() {
     }
     post({ type: "progress", stage: "setup", percent: 48, detail: "Python 악보 인식 모듈 컴파일 중" });
     pyodide.runPython(`import sys; sys.path.insert(0, "${lib}")`);
-    recognise = pyodide.pyimport("runner").recognise;
-    recogniseProfiled = pyodide.pyimport("runner").recognise_profiled;
+    // Use async Python entrypoints directly. In Safari, wrapping a synchronous
+    // PyProxy with callPromising() can leave JavaScript frames between the
+    // promising and suspending Wasm frames, which WebKit correctly rejects.
+    const runner = pyodide.pyimport("runner");
+    recognise = runner.recognise_async;
+    recogniseProfiled = runner.recognise_profiled_async;
   })();
 
   await Promise.all([pythonTask, modelsTask]);
@@ -404,7 +408,7 @@ self.onmessage = async ({ data }) => {
       staffCount = 0;
       // data.systems: the user's systems for this page (JSON), if they fixed it.
       // data.profile (tests/omr-bench.html): logs where the Python's time goes.
-      const xml = await (data.profile ? recogniseProfiled : recognise).callPromising(path, data.systems ?? "");
+      const xml = await (data.profile ? recogniseProfiled : recognise)(path, data.systems ?? "");
       const ms = Math.round(performance.now() - t0);
       const names = [...sessionIds.keys()];
       const parts = names.map((n) => `${n.split("_")[0]} ${Math.round(runTimes[sessionIds.get(n)]?.ms ?? 0)} ms/${runTimes[sessionIds.get(n)]?.calls ?? 0} calls`);

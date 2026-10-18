@@ -18,7 +18,7 @@ const firebaseConfig = {
   appId: "1:212280640512:web:6cc1b579efa21b0ae044e5",
 };
 
-type CloudScore = Pick<StoredScore, "id" | "name" | "xml" | "savedAt" | "updatedAt" | "note" | "annotations">;
+type CloudScore = Pick<StoredScore, "id" | "name" | "xml" | "savedAt" | "updatedAt" | "note" | "annotations"> & { displayName?: string };
 
 export function retainBandKey(url: URL, storage: Pick<Storage, "getItem" | "setItem">): { key: string; cleanUrl?: string } | null {
   const supplied = url.searchParams.get("key")?.trim();
@@ -37,6 +37,7 @@ function isCloudScore(value: unknown): value is CloudScore {
   const score = value as Partial<CloudScore>;
   return typeof score.id === "string" && SCORE_ID_PATTERN.test(score.id)
     && typeof score.name === "string" && score.name.length <= 300
+    && (score.displayName === undefined || (typeof score.displayName === "string" && score.displayName.length > 0 && score.displayName.length <= 120))
     && typeof score.xml === "string" && score.xml.length <= 8_000_000
     && typeof score.savedAt === "number" && Number.isFinite(score.savedAt)
     && typeof score.updatedAt === "number" && Number.isFinite(score.updatedAt)
@@ -84,9 +85,10 @@ export class FirebaseSync {
   async save(score: StoredScore): Promise<void> {
     if (!SCORE_ID_PATTERN.test(score.id)) throw new Error("공유할 수 없는 악보 ID입니다.");
     await this.authenticate();
-    const { id, name, xml, savedAt, updatedAt, note = "", annotations = [] } = score;
+    const { id, name, displayName, xml, savedAt, updatedAt, note = "", annotations = [] } = score;
     await set(ref(this.database, `bands/${this.bandKey}/scores/${id}`), {
       id, name, xml, savedAt, updatedAt: updatedAt ?? savedAt, note,
+      ...(displayName ? { displayName } : {}),
       ...(annotations.length ? { annotations } : {}),
     } satisfies CloudScore);
   }
