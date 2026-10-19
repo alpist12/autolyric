@@ -172,6 +172,10 @@ async function newSession(id) {
     session = await ort.InferenceSession.create(await modelBytes(name), {
       executionProviders: eps,
       graphOptimizationLevel: isAppleMobile ? "basic" : "all",
+      // iOS kills the worker silently past its memory cap; the arena and
+      // memory pattern keep big peak buffers alive across all three models.
+      enableCpuMemArena: !isAppleMobile,
+      enableMemPattern: !isAppleMobile,
     });
   } finally {
     clearInterval(heartbeat);
@@ -182,16 +186,19 @@ async function newSession(id) {
   return session;
 }
 
+async function ensureSession(name) {
+  if (sessionIds.has(name)) return;
+  const id = sessions.length;
+  sessionNames[id] = name;
+  post({ type: "progress", stage: "infer", step: "session", model: name.split("_")[0], index: id + 1, total: MODELS.length });
+  sessions[id] = await newSession(id);
+  sessionIds.set(name, id);
+}
+
 // Called from omr/onnxruntime.py.
 self.omrOrt = {
   async create(name) {
-    if (!sessionIds.has(name)) {
-      const id = sessions.length;
-      sessionNames[id] = name;
-      post({ type: "progress", stage: "infer", step: "session", model: name.split("_")[0], index: id + 1, total: MODELS.length });
-      sessions[id] = await newSession(id);
-      sessionIds.set(name, id);
-    }
+    await ensureSession(name);
     const s = sessions[sessionIds.get(name)];
     return { id: sessionIds.get(name), inputNames: s.inputNames, outputNames: s.outputNames };
   },
@@ -347,6 +354,13 @@ async function init() {
       : 1;
     post({ type: "log", msg: `WASM threads: ${ort.env.wasm.numThreads}` });
     post({ type: "progress", stage: "setup", percent: 9, detail: "Pyodide 런타임 모듈 불러오는 중" });
+    // Pyodide sniffs iOS and then calls every C function pointer through a JS
+    // trampoline; that JS frame makes each JSPI suspend fail ("trying to
+    // suspend JS frames"). JSPI-capable Safari has the wasm-gc trampoline, so
+    // hide the iOS user agent from it (isAppleMobile is already computed).
+    if (isAppleMobile) {
+      Object.defineProperty(self.navigator, "userAgent", { value: "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Safari/605.1.15" });
+    }
     const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
     post({ type: "progress", stage: "setup", percent: 12, detail: "기기 그래픽 가속(WebGPU) 지원 확인 중" });
     try {
@@ -401,6 +415,13 @@ async function init() {
   })();
 
   await Promise.all([pythonTask, modelsTask]);
+  // Create every session before Python runs. In Safari, creating one while
+  // Python waits in run_sync fails with "JavaScript frames found between
+  // WebAssembly.Suspending and WebAssembly.promising" and kills Pyodide.
+  for (const [i, name] of MODELS.entries()) {
+    post({ type: "progress", stage: "setup", percent: 99, detail: `신경망 모델 메모리에 올리는 중 (${i + 1}/${MODELS.length})` });
+    await ensureSession(name);
+  }
   post({ type: "progress", stage: "setup", percent: 100, detail: "무료 인식 엔진 설치 및 준비 완료" });
   post({ type: "ready", gpu: useGpu });
 }
@@ -419,15 +440,20 @@ self.onmessage = async ({ data }) => {
       const t0 = performance.now();
       runTimes = [];
       staffCount = 0;
+      post({ type: "progress", stage: "infer", step: "preprocess" });
       // data.systems: the user's systems for this page (JSON), if they fixed it.
       // data.profile (tests/omr-bench.html): logs where the Python's time goes.
-      const xml = await (data.profile ? recogniseProfiled : recognise)(path, data.systems ?? "");
-      const ms = Math.round(performance.now() - t0);
-      const names = [...sessionIds.keys()];
-      const parts = names.map((n) => `${n.split("_")[0]} ${Math.round(runTimes[sessionIds.get(n)]?.ms ?? 0)} ms/${runTimes[sessionIds.get(n)]?.calls ?? 0} calls`);
-      const inModels = runTimes.reduce((sum, t) => sum + (t?.ms ?? 0), 0);
-      post({ type: "log", msg: `Page in ${ms} ms: ${parts.join(", ")}; Python ${Math.round(ms - inModels)} ms` });
-      post({ type: "result", id: data.id, xml, ms });
+      try {
+        const xml = await (data.profile ? recogniseProfiled : recognise)(path, data.systems ?? "");
+        const ms = Math.round(performance.now() - t0);
+        const names = [...sessionIds.keys()];
+        const parts = names.map((n) => `${n.split("_")[0]} ${Math.round(runTimes[sessionIds.get(n)]?.ms ?? 0)} ms/${runTimes[sessionIds.get(n)]?.calls ?? 0} calls`);
+        const inModels = runTimes.reduce((sum, t) => sum + (t?.ms ?? 0), 0);
+        post({ type: "log", msg: `Page in ${ms} ms: ${parts.join(", ")}; Python ${Math.round(ms - inModels)} ms` });
+        post({ type: "result", id: data.id, xml, ms });
+      } finally {
+        try { pyodide.FS.unlink(path); } catch {}
+      }
     }
   } catch (e) {
     post({ type: "error", id: data.id, msg: String(e && e.message ? e.message : e) });

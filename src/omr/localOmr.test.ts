@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
-import { ensurePdfjsPolyfills, formatLocalOmrError, localOmrUnsupportedMessage, mapOmrSetupToOverallProgress, mergeMusicXmlPages } from "./localOmr";
+import { ensurePdfjsPolyfills, formatLocalOmrError, getOmrRenderLimits, localOmrUnsupportedMessage, mapOmrSetupToOverallProgress, mergeMusicXmlPages } from "./localOmr";
 
 Object.assign(globalThis, { DOMParser, XMLSerializer });
 
@@ -68,5 +68,12 @@ describe("mapOmrSetupToOverallProgress", () => {
     expect(mapOmrSetupToOverallProgress(0)).toBe(14);
     expect(mapOmrSetupToOverallProgress(50)).toBe(35);
     expect(mapOmrSetupToOverallProgress(100)).toBe(55);
+  });
+});
+
+describe("getOmrRenderLimits", () => {
+  it("uses a lower one-page-at-a-time render size on Apple mobile devices", () => {
+    expect(getOmrRenderLimits("Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15")).toEqual({ maxWidth: 1800, maxSide: 3000 });
+    expect(getOmrRenderLimits("Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15")).toEqual({ maxWidth: 2480, maxSide: 4200 });
   });
 });

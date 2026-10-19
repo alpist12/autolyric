@@ -25,6 +25,11 @@ export function mapOmrSetupToOverallProgress(setupPercent: number): number {
   return 14 + Math.round(Math.min(100, Math.max(0, setupPercent)) * 0.41);
 }
 
+export function getOmrRenderLimits(userAgent = navigator.userAgent): { maxWidth: number; maxSide: number } {
+  const isAppleMobile = /iPad|iPhone|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && /Mobile/i.test(userAgent));
+  return isAppleMobile ? { maxWidth: 1800, maxSide: 3000 } : { maxWidth: 2480, maxSide: 4200 };
+}
+
 export function ensurePdfjsPolyfills(): void {
   const proto = Uint8Array.prototype as Uint8Array & { toHex?: () => string };
   if (typeof proto.toHex !== "function") {
@@ -157,34 +162,37 @@ export async function renderPdfPageToCanvas(file: File, pageNumber: number, canv
   }
 }
 
-async function renderPdf(file: File, onProgress: (pct: number, msg: string) => void): Promise<ArrayBuffer[]> {
+async function renderPdfPages(
+  file: File,
+  onProgress: (pct: number, msg: string) => void,
+  onPage: (image: ArrayBuffer, pageNumber: number, pageCount: number) => Promise<void>,
+): Promise<void> {
   ensurePdfjsPolyfills();
   const pdfjs = await import(/* @vite-ignore */ `${PDFJS_URL}pdf.min.mjs`);
   pdfjs.GlobalWorkerOptions.workerSrc = `${PDFJS_URL}pdf.worker.min.mjs`;
   const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const document = await task.promise;
-  const rendered: ArrayBuffer[] = [];
+  const { maxWidth, maxSide } = getOmrRenderLimits();
   try {
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       onProgress(4 + Math.round((pageNumber / document.numPages) * 10), `PDF ${pageNumber}/${document.numPages}페이지 이미지 변환 중`);
       const page = await document.getPage(pageNumber);
       const base = page.getViewport({ scale: 1 });
-      const scale = Math.min(2480 / base.width, 4200 / Math.max(base.width, base.height));
+      const scale = Math.min(maxWidth / base.width, maxSide / Math.max(base.width, base.height));
       const viewport = page.getViewport({ scale });
       const canvas = window.document.createElement("canvas");
       canvas.width = Math.round(viewport.width);
       canvas.height = Math.round(viewport.height);
       await page.render({ canvas, viewport, background: "#ffffff" }).promise;
       const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("PDF 페이지를 이미지로 만들지 못했습니다.")), "image/png"));
-      rendered.push(await blob.arrayBuffer());
       canvas.width = 0;
       canvas.height = 0;
       page.cleanup();
+      await onPage(await blob.arrayBuffer(), pageNumber, document.numPages);
     }
   } finally {
     await task.destroy();
   }
-  return rendered;
 }
 
 type WarmupState = {
@@ -270,6 +278,8 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   let pdfRendered = false;
   let pageIndex = 0;
   let totalPages = 1;
+  let lastInferenceMessage = "";
+  let lastInferenceEventAt = performance.now();
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
@@ -313,7 +323,9 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
   };
 
   worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
-    if (data.type === "loaded") {
+    if (data.type === "log") {
+      console.info("[omr]", data.msg);
+    } else if (data.type === "loaded") {
       worker.postMessage({ type: "init" });
     } else if (data.type === "ready") {
       engineReady = true;
@@ -342,28 +354,33 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
       const st = `네트워크 재연결 시도 중 · ${data.attempt ?? 1}회`;
       emitProgress(undefined, undefined, st);
     } else if (data.type === "progress" && data.stage === "infer") {
+      lastInferenceEventAt = performance.now();
       const pageSpan = 39 / Math.max(1, totalPages);
       const pageBase = 55 + pageIndex * pageSpan;
       const prefix = `악보 ${pageIndex + 1}/${totalPages}쪽`;
       if (data.step === "session") {
         const sub = ((data.index ?? 1) / Math.max(1, data.total ?? 3)) * 0.15;
         const elapsed = data.elapsed ? ` · ${data.elapsed}초 경과` : "";
-        emitProgress(pageBase + pageSpan * sub, `${prefix} · 신경망 모델 준비 중 (${data.index ?? 1}/${data.total ?? 3})${elapsed}${data.elapsed && data.elapsed >= 20 ? " · iPhone에서는 수 분 걸릴 수 있어요" : ""}`);
+        lastInferenceMessage = `${prefix} · 신경망 모델 준비 중 (${data.index ?? 1}/${data.total ?? 3})${elapsed}${data.elapsed && data.elapsed >= 20 ? " · iPhone에서는 수 분 걸릴 수 있어요" : ""}`;
+        emitProgress(pageBase + pageSpan * sub, lastInferenceMessage);
       } else if (data.step === "run") {
         if (data.model === "segnet") {
           const sub = 0.15 + Math.min(0.25, (data.calls ?? 1) * 0.06);
-          emitProgress(pageBase + pageSpan * sub, `${prefix} · 오선보 및 기호 영역 검출 중 (블록 ${data.calls ?? 1})`);
+          lastInferenceMessage = `${prefix} · 오선보 및 기호 영역 검출 중 (블록 ${data.calls ?? 1})`;
+          emitProgress(pageBase + pageSpan * sub, lastInferenceMessage);
         } else if (data.model === "encoder") {
           const sub = 0.4 + Math.min(0.2, (data.calls ?? 1) * 0.035);
-          emitProgress(pageBase + pageSpan * sub, `${prefix} · 보표 이미지 특징 인코딩 중 (${data.calls ?? 1}번째 보표)`);
+          lastInferenceMessage = `${prefix} · 보표 이미지 특징 인코딩 중 (${data.calls ?? 1}번째 보표)`;
+          emitProgress(pageBase + pageSpan * sub, lastInferenceMessage);
         }
       } else if (data.step === "decode") {
         const staffProgress = Math.min(0.38, ((data.staff ?? 1) - 1) * 0.06 + Math.min(0.06, ((data.tokens ?? 0) / 120) * 0.06));
         const sub = 0.6 + staffProgress;
-        emitProgress(
-          pageBase + pageSpan * sub,
-          `${prefix} · ${data.staff ?? 1}번째 보표 음표 해독 중 (${data.tokens ?? 0}개 기호 인식됨)`,
-        );
+        lastInferenceMessage = `${prefix} · ${data.staff ?? 1}번째 보표 음표 해독 중 (${data.tokens ?? 0}개 기호 인식됨)`;
+        emitProgress(pageBase + pageSpan * sub, lastInferenceMessage);
+      } else if (data.step === "preprocess") {
+        lastInferenceMessage = `${prefix} · 페이지 이미지 전처리 중`;
+        emitProgress(pageBase, lastInferenceMessage);
       }
     } else if (data.type === "result" || data.type === "error") {
       const request = data.id === undefined ? undefined : pending.get(data.id);
@@ -388,45 +405,46 @@ export async function convertPdfLocally(file: File, onProgress: OmrProgress): Pr
     worker.postMessage({ type: "recognise", id, image }, [image]);
   });
 
-  // Gentle ticker during score analysis
-  const ticker = setInterval(() => {
-    if (engineReady) {
-      const pageCeiling = Math.min(93, 55 + Math.round(((pageIndex + 0.9) / Math.max(1, totalPages)) * 39));
-      if (currentPercent < pageCeiling) {
-        emitProgress(currentPercent + 1);
+  const watchdog = setInterval(() => {
+    if (engineReady && pending.size) {
+      const silentSeconds = Math.round((performance.now() - lastInferenceEventAt) / 1000);
+      if (silentSeconds >= 10) {
+        onProgress(currentPercent, `${lastInferenceMessage || currentMessage} · ${silentSeconds}초째 처리 중`);
+      }
+      if (silentSeconds >= 240) {
+        const error = new Error("이 페이지 분석이 4분 동안 응답하지 않았습니다. iPhone/iPad의 메모리를 확보한 뒤 다시 시도해 주세요.");
+        for (const request of pending.values()) request.reject(error);
+        pending.clear();
       }
     }
-  }, 1200);
+  }, 5000);
 
   try {
     emitProgress(3, "PDF를 기기에서 여는 중", setupText);
     if (!adopted) {
       worker.postMessage({ type: "init" });
     }
-    const images = await renderPdf(file, (pct, msg) => {
-      emitProgress(pct, msg);
-    });
-    pdfRendered = true;
-    totalPages = Math.max(1, images.length);
-    if (!engineReady) {
-      emitProgress(14, "무료 인식 엔진 설치 대기 중");
-    }
-    await ready;
     const pages: string[] = [];
-    for (let index = 0; index < images.length; index += 1) {
-      pageIndex = index;
-      const pageStart = 55 + Math.round((index / totalPages) * 39);
-      emitProgress(pageStart, `악보 ${index + 1}/${images.length}쪽 분석 시작`);
-      pages.push(await recognise(images[index]!));
-      const pageDone = 55 + Math.round(((index + 1) / totalPages) * 39);
-      emitProgress(pageDone, `악보 ${index + 1}/${images.length}쪽 인식 완료`);
-    }
+    await renderPdfPages(file, (pct, msg) => emitProgress(pct, msg), async (image, pageNumber, pageCount) => {
+      pdfRendered = true;
+      pageIndex = pageNumber - 1;
+      totalPages = Math.max(1, pageCount);
+      if (!engineReady) emitProgress(14, "무료 인식 엔진 설치 대기 중");
+      await ready;
+      const pageStart = 55 + Math.round((pageIndex / totalPages) * 39);
+      lastInferenceEventAt = performance.now();
+      lastInferenceMessage = `악보 ${pageNumber}/${pageCount}쪽 분석 시작`;
+      emitProgress(pageStart, lastInferenceMessage);
+      pages.push(await recognise(image));
+      const pageDone = 55 + Math.round((pageNumber / totalPages) * 39);
+      emitProgress(pageDone, `악보 ${pageNumber}/${pageCount}쪽 인식 완료`);
+    });
     emitProgress(95, "페이지를 하나의 MusicXML로 합치는 중");
     return mergeMusicXmlPages(pages);
   } catch (reason) {
     throw formatLocalOmrError(reason);
   } finally {
-    clearInterval(ticker);
+    clearInterval(watchdog);
     worker.terminate();
   }
 }
